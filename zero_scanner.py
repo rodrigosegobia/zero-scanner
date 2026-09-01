@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 ZERO Scanner - Advanced SMB Security Assessment Tool
-Author: .Zer0
+Author: Rodrigo Segobia
 Version: 1.0
 License: MIT
-GitHub: https://github.com/zeroaualy/zero-scanner
+GitHub: https://github.com/rodrigosegobia/zero-scanner
 """
 
 import os
@@ -17,9 +17,9 @@ import time
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ============================================
-# COLOR CLASS
-# ============================================
+
+
+
 class Colors:
     RED = "\033[91m"
     GREEN = "\033[92m"
@@ -33,9 +33,9 @@ class Colors:
     END = "\033[0m"
     GRAY = "\033[90m"
 
-# ============================================
-# ASCII ART
-# ============================================
+
+
+
 def show_zero_art():
     """Display ZERO ASCII art"""
     zero_art = f"""{Colors.CYAN}{Colors.BOLD}
@@ -65,30 +65,30 @@ def clear_screen():
     """Clear terminal screen"""
     os.system('clear' if os.name == 'posix' else 'cls')
 
-# ============================================
-# DEPENDENCY CHECKER
-# ============================================
+
+
+
 def check_all_dependencies():
     """Check ALL required and optional dependencies before execution"""
     print(f"\n{Colors.CYAN}{'═'*60}{Colors.END}")
     print(f"{Colors.BOLD}        🔧 CHECKING DEPENDENCIES{Colors.END}")
     print(f"{Colors.CYAN}{'═'*60}{Colors.END}")
     
-    # Core scanning tools (REQUIRED)
+
     required_core = [
         ('nmap', 'Network scanning and service detection'),
         ('smbclient', 'SMB protocol client'),
         ('nc', 'Network connectivity testing (netcat)')
     ]
     
-    # Enumeration tools (REQUIRED for full features)
+
     required_enum = [
         ('nmblookup', 'NetBIOS name lookup (Samba)'),
         ('rpcclient', 'RPC client for Windows services'),
         ('net', 'Samba net utility')
     ]
     
-    # Optional tools (enhanced features)
+
     optional_tools = [
         ('enum4linux', 'Windows/Samba enumeration'),
         ('ldapsearch', 'LDAP query tool'),
@@ -101,7 +101,7 @@ def check_all_dependencies():
     available_required = []
     available_optional = []
     
-    # Check core tools
+
     print(f"\n{Colors.BOLD}🔧 Core Scanning Tools:{Colors.END}")
     for tool, description in required_core:
         try:
@@ -117,7 +117,7 @@ def check_all_dependencies():
             print(f"  {Colors.RED}✗{Colors.END} {tool}: {description} - {Colors.RED}MISSING{Colors.END}")
             missing_required.append(tool)
     
-    # Check enumeration tools
+
     print(f"\n{Colors.BOLD}🔍 Enumeration Tools:{Colors.END}")
     for tool, description in required_enum:
         try:
@@ -129,7 +129,7 @@ def check_all_dependencies():
             print(f"  {Colors.YELLOW}⚠{Colors.END} {tool}: {description} - {Colors.YELLOW}RECOMMENDED{Colors.END}")
             missing_required.append(tool)
     
-    # Check optional tools
+
     print(f"\n{Colors.BOLD}✨ Optional Tools:{Colors.END}")
     for tool, description in optional_tools:
         try:
@@ -141,7 +141,7 @@ def check_all_dependencies():
             print(f"  {Colors.GRAY}○{Colors.END} {tool}: {description} - {Colors.GRAY}OPTIONAL{Colors.END}")
             missing_optional.append(tool)
     
-    # Summary
+
     print(f"\n{Colors.BOLD}📊 Summary:{Colors.END}")
     print(f"  {Colors.GREEN}Available: {len(available_required) + len(available_optional)} tools{Colors.END}")
     
@@ -151,11 +151,11 @@ def check_all_dependencies():
     if missing_optional:
         print(f"  {Colors.YELLOW}Optional: {len(missing_optional)} tools not installed{Colors.END}")
     
-    # Installation instructions for missing tools
+
     if missing_required:
         print(f"\n{Colors.BOLD}🚀 Installation Commands:{Colors.END}")
         
-        # Check OS type
+
         try:
             with open('/etc/os-release', 'r') as f:
                 os_release = f.read().lower()
@@ -181,7 +181,7 @@ def check_all_dependencies():
             print(f"{Colors.YELLOW}General installation:{Colors.END}")
             print(f"  Install: nmap, smbclient, netcat, samba-common-bin, ldap-utils")
     
-    # Ask user to continue or install
+
     if missing_required:
         print(f"\n{Colors.RED}⚠️  Some required tools are missing!{Colors.END}")
         print(f"{Colors.YELLOW}Basic scanning will work, but advanced features may fail.{Colors.END}")
@@ -193,9 +193,9 @@ def check_all_dependencies():
     
     return True
 
-# ============================================
-# MENU SYSTEM
-# ============================================
+
+
+
 class MenuSystem:
     @staticmethod
     def show_main_menu():
@@ -350,19 +350,19 @@ class MenuSystem:
         print(f"{Colors.BOLD}        ⚙️ SCAN OPTIONS{Colors.END}")
         print(f"{Colors.CYAN}{'═'*60}{Colors.END}\n")
         
-        # Verbose mode
+
         verbose = input(f"{Colors.BOLD}Enable verbose output? (y/n): {Colors.END}").strip().lower()
         options['verbose'] = (verbose == 'y')
         
-        # Force mode
+
         force = input(f"{Colors.BOLD}Force scan even if ports appear closed? (y/n): {Colors.END}").strip().lower()
         options['force'] = (force == 'y')
         
-        # Aggressive mode
+
         aggressive = input(f"{Colors.BOLD}Enable aggressive mode? (y/n): {Colors.END}").strip().lower()
         options['aggressive'] = (aggressive == 'y')
         
-        # Save report
+
         save_report = input(f"{Colors.BOLD}Save results to file? (y/n): {Colors.END}").strip().lower()
         options['save_report'] = (save_report == 'y')
         
@@ -371,7 +371,7 @@ class MenuSystem:
             if output_dir and os.path.isdir(output_dir):
                 options['output_dir'] = output_dir
         
-        # Hide banner for next run
+
         hide_banner = input(f"{Colors.BOLD}Hide banner on next run? (y/n): {Colors.END}").strip().lower()
         options['no_banner'] = (hide_banner == 'y')
         
@@ -395,7 +395,7 @@ class MenuSystem:
         
         print(f"{Colors.BOLD}Wordlist Configuration:{Colors.END}\n")
         
-        # User wordlist
+
         use_wordlist = input(f"{Colors.BOLD}Use custom user wordlist? (y/n): {Colors.END}").strip().lower()
         if use_wordlist == 'y':
             while True:
@@ -410,7 +410,7 @@ class MenuSystem:
                     if retry != 'y':
                         break
         
-        # Password wordlist
+
         use_passlist = input(f"{Colors.BOLD}Use custom password wordlist? (y/n): {Colors.END}").strip().lower()
         if use_passlist == 'y':
             while True:
@@ -425,7 +425,7 @@ class MenuSystem:
                     if retry != 'y':
                         break
         
-        # Timeout
+
         try:
             timeout = input(f"{Colors.BOLD}Scan timeout (seconds, default 30): {Colors.END}").strip() or "30"
             config['timeout'] = max(10, min(int(timeout), 300))
@@ -433,7 +433,7 @@ class MenuSystem:
         except ValueError:
             print(f"{Colors.YELLOW}⚠ Using default timeout: 30 seconds{Colors.END}")
         
-        # Threads
+
         try:
             threads = input(f"{Colors.BOLD}Number of threads (default 10): {Colors.END}").strip() or "10"
             config['threads'] = max(1, min(int(threads), 50))
@@ -474,9 +474,9 @@ class MenuSystem:
             except KeyboardInterrupt:
                 return '6'
 
-# ============================================
-# PORT CHECKER CLASS
-# ============================================
+
+
+
 class PortChecker:
     @staticmethod
     def check_port_socket(target, port, protocol="tcp", timeout=2):
@@ -522,9 +522,9 @@ class PortChecker:
         except:
             return False
 
-# ============================================
-# ZERO SCANNER MAIN CLASS
-# ============================================
+
+
+
 class ZeroScanner:
     def __init__(self, target, output=None, verbose=False, force=False, scan_mode="basic", custom_ports=None):
         self.target = target
@@ -800,7 +800,7 @@ class ZeroScanner:
             'scan_results': self.scan_results
         }
         
-        # Save JSON report
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         json_file = os.path.join(output_dir, f"zero_scan_{self.target}_{timestamp}.json")
         
@@ -808,7 +808,7 @@ class ZeroScanner:
             json.dump(report, f, indent=4, ensure_ascii=False)
         self.log(f"JSON report saved to: {json_file}", "SUCCESS")
         
-        # Save text report
+
         text_file = os.path.join(output_dir, f"zero_scan_{self.target}_{timestamp}.txt")
         
         with open(text_file, 'w', encoding='utf-8') as f:
@@ -942,9 +942,9 @@ class ZeroScanner:
             self.log(f"Error: {e}", "ERROR")
             return False
 
-# ============================================
-# POST-SCAN TOOLS
-# ============================================
+
+
+
 class PostScanTools:
     @staticmethod
     def run_enum4linux(target, config):
@@ -953,7 +953,7 @@ class PostScanTools:
         print(f"{Colors.BOLD}        🔍 ENUM4LINUX - {target}{Colors.END}")
         print(f"{Colors.CYAN}{'═'*60}{Colors.END}\n")
         
-        # Check enum4linux dependencies first
+
         missing_deps = []
         for tool in ['nmblookup', 'rpcclient', 'smbclient', 'ldapsearch']:
             try:
@@ -999,7 +999,7 @@ class PostScanTools:
         
         print(f"{Colors.BOLD}Testing all shares anonymously...{Colors.END}\n")
         
-        for share in shares[:5]:  # Test first 5 shares
+        for share in shares[:5]:
             share_name = share['name']
             cmd = f"smbclient //{target}/{share_name} -N -c 'ls' 2>&1"
             
@@ -1091,9 +1091,9 @@ Only use on systems you own or have permission to test.
                 f.write(commands)
             print(f"{Colors.GREEN}Saved to: {filename}{Colors.END}")
 
-# ============================================
-# MAIN APPLICATION
-# ============================================
+
+
+
 class ZeroScannerApp:
     def __init__(self):
         self.config = {}
@@ -1106,7 +1106,7 @@ class ZeroScannerApp:
             try:
                 show_banner()
                 
-                # Check dependencies BEFORE showing menu
+
                 if not check_all_dependencies():
                     print(f"\n{Colors.RED}Cannot continue without required dependencies.{Colors.END}")
                     choice = input(f"{Colors.BOLD}Exit? (y/n): {Colors.END}").strip().lower()
@@ -1117,15 +1117,15 @@ class ZeroScannerApp:
                 
                 choice = MenuSystem.show_main_menu()
                 
-                if choice == '1':  # Quick Scan
+                if choice == '1':
                     self.quick_scan()
-                elif choice == '2':  # Advanced Audit
+                elif choice == '2':
                     self.advanced_audit()
-                elif choice == '3':  # Custom Configuration
+                elif choice == '3':
                     self.custom_configuration()
-                elif choice == '4':  # Post-Scan Tools
+                elif choice == '4':
                     self.post_scan_tools()
-                elif choice == '5':  # Exit
+                elif choice == '5':
                     self.exit_app()
                     
             except KeyboardInterrupt:
@@ -1227,19 +1227,19 @@ class ZeroScannerApp:
         while True:
             choice = MenuSystem.show_next_steps(self.current_target, self.scan_results)
             
-            if choice == '1':  # Detailed Enumeration
+            if choice == '1':
                 PostScanTools.run_enum4linux(self.current_target, self.config)
-            elif choice == '2':  # Share Access Testing
+            elif choice == '2':
                 shares = self.scan_results.get('shares', [])
                 PostScanTools.test_share_access(self.current_target, shares)
-            elif choice == '3':  # Brute Force
+            elif choice == '3':
                 print(f"\n{Colors.YELLOW}Brute force requires Hydra and wordlists.{Colors.END}")
                 print(f"{Colors.YELLOW}Configure in Custom Configuration menu.{Colors.END}")
-            elif choice == '4':  # Vulnerability Scanning
+            elif choice == '4':
                 PostScanTools.run_vulnerability_scan(self.current_target)
-            elif choice == '5':  # Generate Commands
+            elif choice == '5':
                 PostScanTools.generate_commands(self.current_target, self.scan_results)
-            elif choice == '6':  # Return
+            elif choice == '6':
                 break
             
             if choice != '6':
@@ -1268,9 +1268,9 @@ class ZeroScannerApp:
         print(f"{Colors.GRAY}Author: .Zer0 | GitHub: zeroaualy{Colors.END}\n")
         sys.exit(0)
 
-# ============================================
-# COMMAND LINE INTERFACE
-# ============================================
+
+
+
 def cli_mode():
     """Command line interface mode"""
     parser = argparse.ArgumentParser(description='ZERO Scanner - Advanced SMB Security Assessment Tool')
@@ -1285,17 +1285,17 @@ def cli_mode():
     
     args = parser.parse_args()
     
-    # Check dependencies FIRST
+
     if not check_all_dependencies():
         print(f"{Colors.RED}Cannot continue without required dependencies.{Colors.END}")
         sys.exit(1)
     
     if args.interactive or not args.target:
-        # Launch interactive mode
+
         app = ZeroScannerApp()
         app.run()
     else:
-        # CLI mode
+
         custom_ports = None
         if args.mode == 'custom' and args.ports:
             try:
@@ -1323,9 +1323,9 @@ def cli_mode():
         
         scanner.run_scan()
 
-# ============================================
-# MAIN ENTRY POINT
-# ============================================
+
+
+
 if __name__ == "__main__":
     try:
         if len(sys.argv) > 1:
