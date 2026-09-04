@@ -8,14 +8,110 @@ GitHub: https://github.com/rodrigosegobia/zero-scanner
 """
 
 import os
+import re
 import sys
 import json
+import errno
+import shutil
 import socket
+import ipaddress
 import argparse
 import subprocess
 import time
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+# RFC 1123 hostname / IPv4 / IPv6-literal validation. This is the single
+# gate that makes every downstream shell=True string interpolation safe:
+# if a value can't pass this, it never reaches a command line.
+_HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)"
+    r"(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*$"
+)
+
+
+def validate_target(target):
+    """
+    Return True only if `target` is a syntactically valid IPv4/IPv6
+    address or RFC-1123 hostname. Rejects anything that could act as a
+    shell metacharacter (;, |, &, $, `, quotes, whitespace, etc.) before
+    it ever reaches a subprocess command line.
+    """
+    if not target or len(target) > 253:
+        return False
+    try:
+        ipaddress.ip_address(target)
+        return True
+    except ValueError:
+        pass
+    return bool(_HOSTNAME_RE.match(target))
+
+
+def validate_share_name(name):
+    """
+    SMB share names are attacker-influenced: they come back from the
+    target server's own -L listing. Never trust them as shell input.
+    Samba/Windows share names are alphanumeric plus a small safe set;
+    reject anything else outright rather than trying to escape it.
+    """
+    return bool(re.match(r"^[A-Za-z0-9_\-\.$ ]{1,80}$", name or ""))
+
+
+def run_cmd(args, timeout=30):
+    """
+    Run a command as an argument list (never shell=True, never string
+    interpolation). Returns a subprocess.CompletedProcess-like object.
+    Centralizing this also means every caller gets the same exception
+    handling instead of N slightly-different bare excepts.
+    """
+    return subprocess.run(
+        args, capture_output=True, text=True, timeout=timeout, shell=False
+    )
+
+
+class ToolResolver:
+    """
+    Resolves the real, invocable form of a tool instead of assuming
+    'the binary is named exactly like the tool and sits on PATH'. This
+    exists specifically because enum4linux-ng is commonly installed as
+    a standalone script (e.g. via git clone) and run through the Python
+    interpreter, not as a PATH binary — 'which enum4linux' will never
+    find it, and that is not a bug in the detection code, it's a wrong
+    assumption about how the tool is distributed.
+    """
+
+    @staticmethod
+    def resolve_enum4linux():
+        """
+        Returns dict: {available, variant, invoke} or None.
+        variant is 'ng' or 'classic' — callers MUST branch on this,
+        because enum4linux-ng's CLI and output format differ from the
+        classic tool; detecting it is only half the fix.
+        """
+        # 1. Classic enum4linux on PATH
+        path = shutil.which("enum4linux")
+        if path:
+            return {"available": True, "variant": "classic", "invoke": [path]}
+
+        # 2. enum4linux-ng on PATH (e.g. pipx/pip installed with a console script)
+        path = shutil.which("enum4linux-ng")
+        if path:
+            return {"available": True, "variant": "ng", "invoke": [path]}
+
+        # 3. enum4linux-ng as a cloned script, run via interpreter
+        #    (the common case in Termux / manual git-clone installs)
+        candidate_scripts = [
+            os.path.expanduser("~/enum4linux-ng/enum4linux-ng.py"),
+            os.path.expanduser("~/tools/enum4linux-ng/enum4linux-ng.py"),
+        ]
+        py = shutil.which("python3") or shutil.which("python")
+        if py:
+            for script in candidate_scripts:
+                if os.path.isfile(script):
+                    return {"available": True, "variant": "ng", "invoke": [py, script]}
+
+        return {"available": False, "variant": None, "invoke": None}
 
 
 
@@ -56,7 +152,7 @@ def show_banner():
 ╔══════════════════════════════════════════════════════════════╗
 ║                    ZERO SCANNER v1.0                         ║
 ║          Advanced SMB Security Assessment Tool               ║
-║                 Author: .Zer0 | github.com/zeroaualy         ║
+║           Author: Rodrigo Segobia | github.com/rodrigosegobia║
 ╚══════════════════════════════════════════════════════════════╝
 {Colors.END}"""
     print(banner)
@@ -90,7 +186,6 @@ def check_all_dependencies():
     
 
     optional_tools = [
-        ('enum4linux', 'Windows/Samba enumeration'),
         ('ldapsearch', 'LDAP query tool'),
         ('polenum', 'Windows policy enumeration'),
         ('hydra', 'Brute force tool')
@@ -104,42 +199,47 @@ def check_all_dependencies():
 
     print(f"\n{Colors.BOLD}🔧 Core Scanning Tools:{Colors.END}")
     for tool, description in required_core:
-        try:
-            if tool == 'nc':
-                subprocess.run(['which', 'nc'], check=True, 
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            else:
-                subprocess.run(['which', tool], check=True, 
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if shutil.which(tool):
             print(f"  {Colors.GREEN}✓{Colors.END} {tool}: {description}")
             available_required.append(tool)
-        except:
+        else:
             print(f"  {Colors.RED}✗{Colors.END} {tool}: {description} - {Colors.RED}MISSING{Colors.END}")
             missing_required.append(tool)
     
 
     print(f"\n{Colors.BOLD}🔍 Enumeration Tools:{Colors.END}")
     for tool, description in required_enum:
-        try:
-            subprocess.run(['which', tool], check=True, 
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if shutil.which(tool):
             print(f"  {Colors.GREEN}✓{Colors.END} {tool}: {description}")
             available_required.append(tool)
-        except:
+        else:
             print(f"  {Colors.YELLOW}⚠{Colors.END} {tool}: {description} - {Colors.YELLOW}RECOMMENDED{Colors.END}")
             missing_required.append(tool)
     
 
     print(f"\n{Colors.BOLD}✨ Optional Tools:{Colors.END}")
     for tool, description in optional_tools:
-        try:
-            subprocess.run(['which', tool], check=True, 
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if shutil.which(tool):
             print(f"  {Colors.GREEN}✓{Colors.END} {tool}: {description}")
             available_optional.append(tool)
-        except:
+        else:
             print(f"  {Colors.GRAY}○{Colors.END} {tool}: {description} - {Colors.GRAY}OPTIONAL{Colors.END}")
             missing_optional.append(tool)
+
+    # enum4linux is resolved separately: it may be 'classic', '-ng' on PATH,
+    # or an -ng script invoked via interpreter. Name-only detection
+    # (shutil.which('enum4linux')) would silently miss the last two.
+    e4l = ToolResolver.resolve_enum4linux()
+    print(f"\n{Colors.BOLD}🔎 SMB/Windows Enumeration Engine:{Colors.END}")
+    if e4l["available"]:
+        label = "enum4linux-ng" if e4l["variant"] == "ng" else "enum4linux"
+        print(f"  {Colors.GREEN}✓{Colors.END} {label} ({' '.join(e4l['invoke'])}): "
+              f"Windows/Samba enumeration")
+        available_optional.append(label)
+    else:
+        print(f"  {Colors.GRAY}○{Colors.END} enum4linux/enum4linux-ng: "
+              f"Windows/Samba enumeration - {Colors.GRAY}OPTIONAL{Colors.END}")
+        missing_optional.append("enum4linux")
     
 
     print(f"\n{Colors.BOLD}📊 Summary:{Colors.END}")
@@ -270,6 +370,157 @@ class MenuSystem:
         
         for mode in modes:
             print(f"  {mode}")
+        
+        print()
+        
+        while True:
+            try:
+                choice = input(f"{Colors.BOLD}Select scan mode (1-3): {Colors.END}").strip()
+                if choice in ['1', '2', '3']:
+                    return choice
+                print(f"{Colors.RED}Invalid choice. Please enter 1, 2, or 3.{Colors.END}")
+            except KeyboardInterrupt:
+                print(f"\n{Colors.YELLOW}Operation cancelled.{Colors.END}")
+                return None
+
+    @staticmethod
+    def get_custom_ports():
+        """Get custom ports from user"""
+        print(f"\n{Colors.CYAN}Enter ports to scan:{Colors.END}")
+        print(f"{Colors.GRAY}Examples: 139,445,135,389{Colors.END}")
+        print(f"{Colors.GRAY}          1-100 (range){Colors.END}")
+        print(f"{Colors.GRAY}          22,80,443,8080-8090{Colors.END}\n")
+        
+        while True:
+            try:
+                ports_input = input(f"{Colors.BOLD}Ports: {Colors.END}").strip()
+                
+                if not ports_input:
+                    print(f"{Colors.RED}Please enter at least one port.{Colors.END}")
+                    continue
+                
+                ports = []
+                for part in ports_input.split(','):
+                    part = part.strip()
+                    if '-' in part:
+                        try:
+                            start, end = map(int, part.split('-'))
+                            ports.extend(range(start, end + 1))
+                        except ValueError:
+                            print(f"{Colors.RED}Invalid range: {part}{Colors.END}")
+                            continue
+                    else:
+                        try:
+                            ports.append(int(part))
+                        except ValueError:
+                            print(f"{Colors.RED}Invalid port: {part}{Colors.END}")
+                            continue
+                
+                if not ports:
+                    print(f"{Colors.RED}No valid ports entered.{Colors.END}")
+                    continue
+                
+                ports = sorted(set(ports))
+                
+                invalid_ports = [p for p in ports if p < 1 or p > 65535]
+                if invalid_ports:
+                    print(f"{Colors.RED}Invalid ports (must be 1-65535): {invalid_ports}{Colors.END}")
+                    continue
+                
+                print(f"{Colors.GREEN}✓ Will scan {len(ports)} ports{Colors.END}")
+                return ports
+                
+            except KeyboardInterrupt:
+                print(f"\n{Colors.YELLOW}Operation cancelled.{Colors.END}")
+                return None
+
+    @staticmethod
+    def get_scan_options():
+        """Get additional scan options"""
+        options = {
+            'verbose': False,
+            'force': False,
+            'save_report': True,
+            'output_dir': os.getcwd(),
+            'no_banner': False,
+            'aggressive': False
+        }
+        
+        print(f"\n{Colors.CYAN}{'═'*60}{Colors.END}")
+        print(f"{Colors.BOLD}        ⚙️ SCAN OPTIONS{Colors.END}")
+        print(f"{Colors.CYAN}{'═'*60}{Colors.END}\n")
+        
+
+        verbose = input(f"{Colors.BOLD}Enable verbose output? (y/n): {Colors.END}").strip().lower()
+        options['verbose'] = (verbose == 'y')
+        
+
+        force = input(f"{Colors.BOLD}Force scan even if ports appear closed? (y/n): {Colors.END}").strip().lower()
+        options['force'] = (force == 'y')
+        
+
+        aggressive = input(f"{Colors.BOLD}Enable aggressive mode? (y/n): {Colors.END}").strip().lower()
+        options['aggressive'] = (aggressive == 'y')
+        
+
+        save_report = input(f"{Colors.BOLD}Save results to file? (y/n): {Colors.END}").strip().lower()
+        options['save_report'] = (save_report == 'y')
+        
+        if options['save_report']:
+            output_dir = input(f"{Colors.BOLD}Output directory (Enter for current): {Colors.END}").strip()
+            if output_dir and os.path.isdir(output_dir):
+                options['output_dir'] = output_dir
+        
+
+        hide_banner = input(f"{Colors.BOLD}Hide banner on next run? (y/n): {Colors.END}").strip().lower()
+        options['no_banner'] = (hide_banner == 'y')
+        
+        return options
+
+    @staticmethod
+    def configure_tools():
+        """Configure tools and wordlists"""
+        config = {
+            'wordlist_users': None,
+            'wordlist_passwords': None,
+            'enum4linux_path': 'enum4linux',
+            'hydra_path': 'hydra',
+            'timeout': 30,
+            'threads': 10
+        }
+        
+        print(f"\n{Colors.CYAN}{'═'*60}{Colors.END}")
+        print(f"{Colors.BOLD}        ⚙️ TOOL CONFIGURATION{Colors.END}")
+        print(f"{Colors.CYAN}{'═'*60}{Colors.END}\n")
+        
+        print(f"{Colors.BOLD}Wordlist Configuration:{Colors.END}\n")
+        
+
+        use_wordlist = input(f"{Colors.BOLD}Use custom user wordlist? (y/n): {Colors.END}").strip().lower()
+        if use_wordlist == 'y':
+            while True:
+                path = input(f"{Colors.BOLD}Path to user wordlist: {Colors.END}").strip()
+                if os.path.exists(path):
+                    config['wordlist_users'] = path
+                    print(f"{Colors.GREEN}✓ User wordlist set: {path}{Colors.END}")
+                    break
+                else:
+                    print(f"{Colors.RED}✗ File not found: {path}{Colors.END}")
+                    retry = input(f"{Colors.BOLD}Try again? (y/n): {Colors.END}").strip().lower()
+                    if retry != 'y':
+                        break
+        
+
+        use_passlist = input(f"{Colors.BOLD}Use custom password wordlist? (y/n): {Colors.END}").strip().lower()
+        if use_passlist == 'y':
+            while True:
+                path = input(f"{Colors.BOLD}Path to password wordlist: {Colors.END}").strip()
+                if os.path.exists(path):
+                    config['wordlist_passwords'] = path
+                    print(f"{Colors.GREEN}✓ Password wordlist set: {path}{Colors.END}")
+                    break
+                else:
+                    print(f"{Colors.RED}✗ File not found: {path}{Colors.int(f"  {mode}")
         
         print()
         
