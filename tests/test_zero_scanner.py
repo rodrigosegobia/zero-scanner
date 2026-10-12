@@ -1,6 +1,7 @@
 """Testes unitários de funcionalidades locais do ZERO Scanner (sem acesso à rede)."""
 
 import contextlib
+from contextlib import ExitStack
 import io
 import json
 import subprocess
@@ -56,12 +57,13 @@ class ValidacoesTestes(unittest.TestCase):
 class FluxoTestes(unittest.TestCase):
     def test_nao_executa_consultas_smb_sem_portas_confirmadas(self):
         instancia = scanner.Scanner("127.0.0.1", salvar=False)
-        with (patch.object(instancia, "verificar_ferramentas"),
-              patch.object(instancia, "verificar_portas"),
-              patch.object(instancia, "identificar_smb") as nmap,
-              patch.object(instancia, "listar_compartilhamentos") as smb,
-              patch.object(instancia, "verificar_ms17_010") as vuln,
-              contextlib.redirect_stdout(io.StringIO())):
+        with ExitStack() as pilha:
+            pilha.enter_context(patch.object(instancia, "verificar_ferramentas"))
+            pilha.enter_context(patch.object(instancia, "verificar_portas"))
+            nmap = pilha.enter_context(patch.object(instancia, "identificar_smb"))
+            smb = pilha.enter_context(patch.object(instancia, "listar_compartilhamentos"))
+            vuln = pilha.enter_context(patch.object(instancia, "verificar_ms17_010"))
+            pilha.enter_context(contextlib.redirect_stdout(io.StringIO()))
             resultado = instancia.executar()
         self.assertEqual(resultado["ms17_010"], "nao_testado")
         nmap.assert_not_called()
@@ -72,9 +74,10 @@ class FluxoTestes(unittest.TestCase):
         instancia = scanner.Scanner("127.0.0.1", salvar=False)
         retorno = subprocess.CompletedProcess(args=["nmap"], returncode=0,
                                              stdout="Nmap scan report", stderr="")
-        with (patch.object(scanner.shutil, "which", return_value="/bin/nmap"),
-              patch.object(scanner, "executar", return_value=retorno),
-              contextlib.redirect_stdout(io.StringIO())):
+        with ExitStack() as pilha:
+            pilha.enter_context(patch.object(scanner.shutil, "which", return_value="/bin/nmap"))
+            pilha.enter_context(patch.object(scanner, "executar", return_value=retorno))
+            pilha.enter_context(contextlib.redirect_stdout(io.StringIO()))
             instancia.verificar_ms17_010()
         self.assertEqual(instancia.dados["ms17_010"], "inconclusivo")
 
@@ -93,9 +96,9 @@ class FluxoTestes(unittest.TestCase):
             self.assertEqual(documento["resultados"]["ms17_010"], "inconclusivo")
 
     def test_comando_personalizado_exige_portas(self):
-        with (contextlib.redirect_stderr(io.StringIO()),
-              self.assertRaises(SystemExit) as erro):
-            scanner.main(["127.0.0.1", "-m", "custom", "--no-report"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as erro:
+                scanner.main(["127.0.0.1", "-m", "custom", "--no-report"])
         self.assertEqual(erro.exception.code, 2)
 
 
