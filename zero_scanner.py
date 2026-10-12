@@ -1,1591 +1,531 @@
 #!/usr/bin/env python3
-"""
-ZERO Scanner - Advanced SMB Security Assessment Tool
-Author: Rodrigo Segobia
-Version: 1.0
-License: MIT
-GitHub: https://github.com/rodrigosegobia/zero-scanner
+# -*- coding: utf-8 -*-
+"""ZERO Scanner - análise de serviços SMB em redes autorizadas.
+
+Desenvolvimento e manutenção: Rodrigo Segobia
+Projeto: https://github.com/rodrigosegobia/zero-scanner
+Licença: MIT
 """
 
-import os
-import re
-import sys
+import argparse
+import ipaddress
 import json
-import errno
+import re
 import shutil
 import socket
-import ipaddress
-import argparse
 import subprocess
-import time
-from datetime import datetime
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
 
-
-# RFC 1123 hostname / IPv4 / IPv6-literal validation. This is the single
-# gate that makes every downstream shell=True string interpolation safe:
-# if a value can't pass this, it never reaches a command line.
-_HOSTNAME_RE = re.compile(
-    r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)"
-    r"(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*$"
+VERSAO = "1.1.0"
+REPOSITORIO = "https://github.com/rodrigosegobia/zero-scanner"
+PORTAS = {
+    "basic": [(139, "tcp", "NetBIOS"), (445, "tcp", "SMB")],
+    "full": [
+        (139, "tcp", "NetBIOS"), (445, "tcp", "SMB"),
+        (137, "udp", "NetBIOS Name Service"),
+        (138, "udp", "NetBIOS Datagram"),
+        (135, "tcp", "MSRPC"), (389, "tcp", "LDAP"),
+        (636, "tcp", "LDAPS"), (88, "tcp", "Kerberos"),
+        (464, "tcp", "Kerberos Password"),
+        (53, "tcp", "DNS"), (53, "udp", "DNS"),
+        (3389, "tcp", "RDP"),
+    ],
+}
+HOSTNAME = re.compile(
+    r"^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
 )
 
 
-def validate_target(target):
-    """
-    Return True only if `target` is a syntactically valid IPv4/IPv6
-    address or RFC-1123 hostname. Rejects anything that could act as a
-    shell metacharacter (;, |, &, $, `, quotes, whitespace, etc.) before
-    it ever reaches a subprocess command line.
-    """
-    if not target or len(target) > 253:
+def validar_alvo(alvo):
+    """Aceita IPv4 ou nome DNS, nunca argumentos de shell ou rede inteira."""
+    if not alvo or len(alvo) > 253 or alvo.startswith("-"):
         return False
     try:
-        ipaddress.ip_address(target)
-        return True
+        return isinstance(ipaddress.ip_address(alvo), ipaddress.IPv4Address)
     except ValueError:
         pass
-    return bool(_HOSTNAME_RE.match(target))
+    if re.fullmatch(r"[0-9.]+", alvo):
+        return False
+    return HOSTNAME.fullmatch(alvo) is not None
 
 
-def validate_share_name(name):
-    """
-    SMB share names are attacker-influenced: they come back from the
-    target server's own -L listing. Never trust them as shell input.
-    Samba/Windows share names are alphanumeric plus a small safe set;
-    reject anything else outright rather than trying to escape it.
-    """
-    return bool(re.match(r"^[A-Za-z0-9_\-\.$ ]{1,80}$", name or ""))
+def analisar_portas(texto):
+    """Converte 139,445,8000-8002 em portas TCP válidas, sem intervalos enormes."""
+    if not texto or not texto.strip():
+        raise ValueError("Informe pelo menos uma porta.")
+    resultado = set()
+    for segmento in texto.split(","):
+        parte = segmento.strip()
+        if re.fullmatch(r"\d+", parte):
+            inicio = fim = int(parte)
+        elif re.fullmatch(r"\d+-\d+", parte):
+            inicio, fim = map(int, parte.split("-", 1))
+        else:
+            raise ValueError("Formato inválido de portas: " + parte)
+        if not (1 <= inicio <= fim <= 65535):
+            raise ValueError("As portas devem estar entre 1 e 65535.")
+        if fim - inicio > 4095 or len(resultado) + fim - inicio + 1 > 4096:
+            raise ValueError("Limite de 4096 portas por execução.")
+        resultado.update(range(inicio, fim + 1))
+    return sorted(resultado)
 
 
-def run_cmd(args, timeout=30):
-    """
-    Run a command as an argument list (never shell=True, never string
-    interpolation). Returns a subprocess.CompletedProcess-like object.
-    Centralizing this also means every caller gets the same exception
-    handling instead of N slightly-different bare excepts.
-    """
+def executar(comando, tempo=30):
+    """Executa comandos externos sem shell e com tempo limite."""
     return subprocess.run(
-        args, capture_output=True, text=True, timeout=timeout, shell=False
+        comando, capture_output=True, text=True, errors="replace",
+        timeout=tempo, check=False
     )
 
 
-class ToolResolver:
-    """
-    Resolves the real, invocable form of a tool instead of assuming
-    'the binary is named exactly like the tool and sits on PATH'. This
-    exists specifically because enum4linux-ng is commonly installed as
-    a standalone script (e.g. via git clone) and run through the Python
-    interpreter, not as a PATH binary — 'which enum4linux' will never
-    find it, and that is not a bug in the detection code, it's a wrong
-    assumption about how the tool is distributed.
-    """
-
-    @staticmethod
-    def resolve_enum4linux():
-        """
-        Returns dict: {available, variant, invoke} or None.
-        variant is 'ng' or 'classic' — callers MUST branch on this,
-        because enum4linux-ng's CLI and output format differ from the
-        classic tool; detecting it is only half the fix.
-        """
-        # 1. Classic enum4linux on PATH
-        path = shutil.which("enum4linux")
-        if path:
-            return {"available": True, "variant": "classic", "invoke": [path]}
-
-        # 2. enum4linux-ng on PATH (e.g. pipx/pip installed with a console script)
-        path = shutil.which("enum4linux-ng")
-        if path:
-            return {"available": True, "variant": "ng", "invoke": [path]}
-
-        # 3. enum4linux-ng as a cloned script, run via interpreter
-        #    (the common case in Termux / manual git-clone installs)
-        candidate_scripts = [
-            os.path.expanduser("~/enum4linux-ng/enum4linux-ng.py"),
-            os.path.expanduser("~/tools/enum4linux-ng/enum4linux-ng.py"),
-        ]
-        py = shutil.which("python3") or shutil.which("python")
-        if py:
-            for script in candidate_scripts:
-                if os.path.isfile(script):
-                    return {"available": True, "variant": "ng", "invoke": [py, script]}
-
-        return {"available": False, "variant": None, "invoke": None}
+def situacao_vulnerabilidade(saida):
+    """Retorna vulnerável, não vulnerável ou inconclusivo sem falsos negativos."""
+    if re.search(r"(?im)^\s*\|?\s*State:\s*VULNERABLE\b", saida):
+        return "vulneravel"
+    if re.search(r"(?im)^\s*\|?\s*State:\s*NOT VULNERABLE\b", saida):
+        return "nao_vulneravel"
+    return "inconclusivo"
 
 
+def testar_porta(alvo, porta, protocolo, tempo):
+    """UDP sem resposta é inconclusivo; não representa uma porta aberta."""
+    try:
+        if protocolo == "tcp":
+            with socket.create_connection((alvo, porta), timeout=tempo):
+                return "aberta"
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as conexao:
+            conexao.settimeout(tempo)
+            conexao.sendto(b"\x00", (alvo, porta))
+            conexao.recvfrom(512)
+        return "respondeu"
+    except (socket.timeout, OSError):
+        return "inconclusiva" if protocolo == "udp" else "fechada_ou_filtrada"
 
 
-class Colors:
-    RED = "\033[91m"
-    GREEN = "\033[92m"
-    YELLOW = "\033[93m"
-    BLUE = "\033[94m"
-    PURPLE = "\033[95m"
-    CYAN = "\033[96m"
-    WHITE = "\033[97m"
-    BOLD = "\033[1m"
-    UNDERLINE = "\033[4m"
-    END = "\033[0m"
-    GRAY = "\033[90m"
+def resolver_enum4linux():
+    """Distingue enum4linux clássico de enum4linux-ng."""
+    caminho = shutil.which("enum4linux-ng")
+    if caminho:
+        return [caminho], "-A"
+    for local in (
+        Path.home() / "enum4linux-ng" / "enum4linux-ng.py",
+        Path.home() / "tools" / "enum4linux-ng" / "enum4linux-ng.py",
+    ):
+        if local.is_file() and shutil.which("python3"):
+            return [shutil.which("python3"), str(local)], "-A"
+    caminho = shutil.which("enum4linux")
+    if caminho:
+        return [caminho], "-a"
+    return None, None
 
 
-
-
-def show_zero_art():
-    """Display ZERO ASCII art"""
-    zero_art = f"""{Colors.CYAN}{Colors.BOLD}
-███████╗███████╗██████╗  ██████╗ 
-╚══███╔╝██╔════╝██╔══██╗██╔═══██╗
-  ███╔╝ █████╗  ██████╔╝██║   ██║
- ███╔╝  ██╔══╝  ██╔══██╗██║   ██║
-███████╗███████╗██║  ██║╚██████╔╝
-╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ 
-{Colors.END}"""
-    print(zero_art)
-
-def show_banner():
-    """Display scanner banner"""
-    clear_screen()
-    show_zero_art()
-    banner = f"""{Colors.PURPLE}{Colors.BOLD}
-╔══════════════════════════════════════════════════════════════╗
-║                    ZERO SCANNER v1.0                         ║
-║          Advanced SMB Security Assessment Tool               ║
-║           Author: Rodrigo Segobia | github.com/rodrigosegobia║
-╚══════════════════════════════════════════════════════════════╝
-{Colors.END}"""
-    print(banner)
-
-def clear_screen():
-    """Clear terminal screen"""
-    os.system('clear' if os.name == 'posix' else 'cls')
-
-
-
-
-def check_all_dependencies():
-    """Check ALL required and optional dependencies before execution"""
-    print(f"\n{Colors.CYAN}{'═'*60}{Colors.END}")
-    print(f"{Colors.BOLD}        🔧 CHECKING DEPENDENCIES{Colors.END}")
-    print(f"{Colors.CYAN}{'═'*60}{Colors.END}")
-    
-
-    required_core = [
-        ('nmap', 'Network scanning and service detection'),
-        ('smbclient', 'SMB protocol client'),
-        ('nc', 'Network connectivity testing (netcat)')
-    ]
-    
-
-    required_enum = [
-        ('nmblookup', 'NetBIOS name lookup (Samba)'),
-        ('rpcclient', 'RPC client for Windows services'),
-        ('net', 'Samba net utility')
-    ]
-    
-
-    optional_tools = [
-        ('ldapsearch', 'LDAP query tool'),
-        ('polenum', 'Windows policy enumeration'),
-        ('hydra', 'Brute force tool')
-    ]
-    
-    missing_required = []
-    missing_optional = []
-    available_required = []
-    available_optional = []
-    
-
-    print(f"\n{Colors.BOLD}🔧 Core Scanning Tools:{Colors.END}")
-    for tool, description in required_core:
-        if shutil.which(tool):
-            print(f"  {Colors.GREEN}✓{Colors.END} {tool}: {description}")
-            available_required.append(tool)
-        else:
-            print(f"  {Colors.RED}✗{Colors.END} {tool}: {description} - {Colors.RED}MISSING{Colors.END}")
-            missing_required.append(tool)
-    
-
-    print(f"\n{Colors.BOLD}🔍 Enumeration Tools:{Colors.END}")
-    for tool, description in required_enum:
-        if shutil.which(tool):
-            print(f"  {Colors.GREEN}✓{Colors.END} {tool}: {description}")
-            available_required.append(tool)
-        else:
-            print(f"  {Colors.YELLOW}⚠{Colors.END} {tool}: {description} - {Colors.YELLOW}RECOMMENDED{Colors.END}")
-            missing_required.append(tool)
-    
-
-    print(f"\n{Colors.BOLD}✨ Optional Tools:{Colors.END}")
-    for tool, description in optional_tools:
-        if shutil.which(tool):
-            print(f"  {Colors.GREEN}✓{Colors.END} {tool}: {description}")
-            available_optional.append(tool)
-        else:
-            print(f"  {Colors.GRAY}○{Colors.END} {tool}: {description} - {Colors.GRAY}OPTIONAL{Colors.END}")
-            missing_optional.append(tool)
-
-    # enum4linux is resolved separately: it may be 'classic', '-ng' on PATH,
-    # or an -ng script invoked via interpreter. Name-only detection
-    # (shutil.which('enum4linux')) would silently miss the last two.
-    e4l = ToolResolver.resolve_enum4linux()
-    print(f"\n{Colors.BOLD}🔎 SMB/Windows Enumeration Engine:{Colors.END}")
-    if e4l["available"]:
-        label = "enum4linux-ng" if e4l["variant"] == "ng" else "enum4linux"
-        print(f"  {Colors.GREEN}✓{Colors.END} {label} ({' '.join(e4l['invoke'])}): "
-              f"Windows/Samba enumeration")
-        available_optional.append(label)
-    else:
-        print(f"  {Colors.GRAY}○{Colors.END} enum4linux/enum4linux-ng: "
-              f"Windows/Samba enumeration - {Colors.GRAY}OPTIONAL{Colors.END}")
-        missing_optional.append("enum4linux")
-    
-
-    print(f"\n{Colors.BOLD}📊 Summary:{Colors.END}")
-    print(f"  {Colors.GREEN}Available: {len(available_required) + len(available_optional)} tools{Colors.END}")
-    
-    if missing_required:
-        print(f"  {Colors.RED}Missing: {len(missing_required)} required/recommended tools{Colors.END}")
-    
-    if missing_optional:
-        print(f"  {Colors.YELLOW}Optional: {len(missing_optional)} tools not installed{Colors.END}")
-    
-
-    if missing_required:
-        print(f"\n{Colors.BOLD}🚀 Installation Commands:{Colors.END}")
-        
-
-        try:
-            with open('/etc/os-release', 'r') as f:
-                os_release = f.read().lower()
-                
-            if 'ubuntu' in os_release or 'debian' in os_release or 'kali' in os_release:
-                print(f"{Colors.YELLOW}For Debian/Ubuntu/Kali:{Colors.END}")
-                print(f"  sudo apt-get update")
-                print(f"  sudo apt-get install -y nmap smbclient netcat samba-common-bin samba-client ldap-utils")
-                
-            elif 'centos' in os_release or 'rhel' in os_release or 'fedora' in os_release:
-                print(f"{Colors.YELLOW}For RHEL/CentOS/Fedora:{Colors.END}")
-                print(f"  sudo yum install -y nmap samba-client nc samba-common-tools openldap-clients")
-                
-            elif 'arch' in os_release:
-                print(f"{Colors.YELLOW}For Arch Linux:{Colors.END}")
-                print(f"  sudo pacman -S nmap samba nmap netcat ldap-utils")
-                
-            else:
-                print(f"{Colors.YELLOW}General installation:{Colors.END}")
-                print(f"  Install: nmap, smbclient, netcat, samba-common-bin, ldap-utils")
-                
-        except:
-            print(f"{Colors.YELLOW}General installation:{Colors.END}")
-            print(f"  Install: nmap, smbclient, netcat, samba-common-bin, ldap-utils")
-    
-
-    if missing_required:
-        print(f"\n{Colors.RED}⚠️  Some required tools are missing!{Colors.END}")
-        print(f"{Colors.YELLOW}Basic scanning will work, but advanced features may fail.{Colors.END}")
-        
-        choice = input(f"\n{Colors.BOLD}Continue anyway? (y/n): {Colors.END}").strip().lower()
-        if choice != 'y':
-            print(f"{Colors.YELLOW}Please install the missing tools and try again.{Colors.END}")
-            return False
-    
-    return True
-
-
-
-
-class MenuSystem:
-    @staticmethod
-    def show_main_menu():
-        """Display main menu"""
-        print(f"\n{Colors.CYAN}{'═'*60}{Colors.END}")
-        print(f"{Colors.BOLD}        🎯 ZERO SCANNER MAIN MENU{Colors.END}")
-        print(f"{Colors.CYAN}{'═'*60}{Colors.END}\n")
-        
-        menus = [
-            f"{Colors.BOLD}[1]{Colors.END} {Colors.GREEN}Quick SMB Scan{Colors.END}",
-            f"{Colors.BOLD}[2]{Colors.END} {Colors.YELLOW}Advanced SMB Audit{Colors.END}",
-            f"{Colors.BOLD}[3]{Colors.END} {Colors.BLUE}Custom Configuration{Colors.END}",
-            f"{Colors.BOLD}[4]{Colors.END} {Colors.PURPLE}Post-Scan Tools{Colors.END}",
-            f"{Colors.BOLD}[5]{Colors.END} {Colors.RED}Exit{Colors.END}"
-        ]
-        
-        for menu in menus:
-            print(f"  {menu}")
-        
-        print(f"\n{Colors.GRAY}{'─'*60}{Colors.END}")
-        
-        while True:
-            try:
-                choice = input(f"{Colors.BOLD}Select option (1-5): {Colors.END}").strip()
-                if choice in ['1', '2', '3', '4', '5']:
-                    return choice
-                print(f"{Colors.RED}Invalid choice. Please enter 1-5.{Colors.END}")
-            except KeyboardInterrupt:
-                print(f"\n{Colors.YELLOW}Operation cancelled.{Colors.END}")
-                return '5'
-
-    @staticmethod
-    def get_target():
-        """Get target IP from user"""
-        print(f"\n{Colors.CYAN}{'═'*60}{Colors.END}")
-        print(f"{Colors.BOLD}        🌐 TARGET SELECTION{Colors.END}")
-        print(f"{Colors.CYAN}{'═'*60}{Colors.END}\n")
-        
-        while True:
-            try:
-                target = input(f"{Colors.BOLD}Enter target IP/hostname: {Colors.END}").strip()
-                
-                if not target:
-                    print(f"{Colors.RED}Please enter a target.{Colors.END}")
-                    continue
-                
-                if target.lower() == 'localhost' or target == '127.0.0.1':
-                    print(f"{Colors.YELLOW}⚠️  Scanning localhost. Make sure you have permission.{Colors.END}")
-                    confirm = input(f"{Colors.BOLD}Continue? (y/n): {Colors.END}").strip().lower()
-                    if confirm != 'y':
-                        continue
-                
-                print(f"{Colors.GREEN}✓ Target set to: {target}{Colors.END}")
-                return target
-                
-            except KeyboardInterrupt:
-                print(f"\n{Colors.YELLOW}Operation cancelled.{Colors.END}")
-                return None
-
-    @staticmethod
-    def get_scan_mode():
-        """Get scan mode from user"""
-        print(f"\n{Colors.CYAN}{'═'*60}{Colors.END}")
-        print(f"{Colors.BOLD}        📡 SCAN MODE SELECTION{Colors.END}")
-        print(f"{Colors.CYAN}{'═'*60}{Colors.END}\n")
-        
-        modes = [
-            f"{Colors.BOLD}[1]{Colors.END} {Colors.GREEN}Basic Scan{Colors.END} (Ports 139 & 445)",
-            f"{Colors.BOLD}[2]{Colors.END} {Colors.YELLOW}Full Audit{Colors.END} (All SMB/AD ports)",
-            f"{Colors.BOLD}[3]{Colors.END} {Colors.BLUE}Custom Ports{Colors.END} (Specify custom ports)"
-        ]
-        
-        for mode in modes:
-            print(f"  {mode}")
-        
-        print()
-        
-        while True:
-            try:
-                choice = input(f"{Colors.BOLD}Select scan mode (1-3): {Colors.END}").strip()
-                if choice in ['1', '2', '3']:
-                    return choice
-                print(f"{Colors.RED}Invalid choice. Please enter 1, 2, or 3.{Colors.END}")
-            except KeyboardInterrupt:
-                print(f"\n{Colors.YELLOW}Operation cancelled.{Colors.END}")
-                return None
-
-    @staticmethod
-    def get_custom_ports():
-        """Get custom ports from user"""
-        print(f"\n{Colors.CYAN}Enter ports to scan:{Colors.END}")
-        print(f"{Colors.GRAY}Examples: 139,445,135,389{Colors.END}")
-        print(f"{Colors.GRAY}          1-100 (range){Colors.END}")
-        print(f"{Colors.GRAY}          22,80,443,8080-8090{Colors.END}\n")
-        
-        while True:
-            try:
-                ports_input = input(f"{Colors.BOLD}Ports: {Colors.END}").strip()
-                
-                if not ports_input:
-                    print(f"{Colors.RED}Please enter at least one port.{Colors.END}")
-                    continue
-                
-                ports = []
-                for part in ports_input.split(','):
-                    part = part.strip()
-                    if '-' in part:
-                        try:
-                            start, end = map(int, part.split('-'))
-                            ports.extend(range(start, end + 1))
-                        except ValueError:
-                            print(f"{Colors.RED}Invalid range: {part}{Colors.END}")
-                            continue
-                    else:
-                        try:
-                            ports.append(int(part))
-                        except ValueError:
-                            print(f"{Colors.RED}Invalid port: {part}{Colors.END}")
-                            continue
-                
-                if not ports:
-                    print(f"{Colors.RED}No valid ports entered.{Colors.END}")
-                    continue
-                
-                ports = sorted(set(ports))
-                
-                invalid_ports = [p for p in ports if p < 1 or p > 65535]
-                if invalid_ports:
-                    print(f"{Colors.RED}Invalid ports (must be 1-65535): {invalid_ports}{Colors.END}")
-                    continue
-                
-                print(f"{Colors.GREEN}✓ Will scan {len(ports)} ports{Colors.END}")
-                return ports
-                
-            except KeyboardInterrupt:
-                print(f"\n{Colors.YELLOW}Operation cancelled.{Colors.END}")
-                return None
-
-    @staticmethod
-    def get_scan_options():
-        """Get additional scan options"""
-        options = {
-            'verbose': False,
-            'force': False,
-            'save_report': True,
-            'output_dir': os.getcwd(),
-            'no_banner': False,
-            'aggressive': False
+class Scanner:
+    def __init__(self, alvo, modo="basic", portas=None, saida=None,
+                 detalhado=False, forcar=False, tempo=3, threads=10,
+                 salvar=True):
+        if not validar_alvo(alvo):
+            raise ValueError("Alvo inválido. Informe um IPv4 ou nome de host válido.")
+        if modo not in PORTAS and modo != "custom":
+            raise ValueError("Modo de varredura inválido.")
+        if modo == "custom" and not portas:
+            raise ValueError("O modo personalizado exige a opção -p/--ports.")
+        self.alvo = alvo
+        self.modo = modo
+        self.portas = portas
+        self.saida = saida
+        self.detalhado = detalhado
+        self.forcar = forcar
+        self.tempo = tempo
+        self.threads = threads
+        self.salvar = salvar
+        self.dados = {
+            "portas_abertas": [],
+            "portas_udp_sem_resposta": [],
+            "compartilhamentos": [],
+            "sistema_operacional": None,
+            "ms17_010": "nao_testado",
+            "ferramentas_ausentes": [],
+            "erros": [],
+            "total_portas_verificadas": 0,
         }
-        
-        print(f"\n{Colors.CYAN}{'═'*60}{Colors.END}")
-        print(f"{Colors.BOLD}        ⚙️ SCAN OPTIONS{Colors.END}")
-        print(f"{Colors.CYAN}{'═'*60}{Colors.END}\n")
-        
 
-        verbose = input(f"{Colors.BOLD}Enable verbose output? (y/n): {Colors.END}").strip().lower()
-        options['verbose'] = (verbose == 'y')
-        
+    def informar(self, mensagem, tipo="INFO"):
+        print(f"[{datetime.now():%H:%M:%S}] [{tipo}] {mensagem}")
 
-        force = input(f"{Colors.BOLD}Force scan even if ports appear closed? (y/n): {Colors.END}").strip().lower()
-        options['force'] = (force == 'y')
-        
+    def verificar_ferramentas(self):
+        for nome in ("nmap", "smbclient"):
+            if shutil.which(nome) is None:
+                self.dados["ferramentas_ausentes"].append(nome)
+                self.informar(f"{nome} não encontrado. Recursos dependentes serão ignorados.", "AVISO")
 
-        aggressive = input(f"{Colors.BOLD}Enable aggressive mode? (y/n): {Colors.END}").strip().lower()
-        options['aggressive'] = (aggressive == 'y')
-        
-
-        save_report = input(f"{Colors.BOLD}Save results to file? (y/n): {Colors.END}").strip().lower()
-        options['save_report'] = (save_report == 'y')
-        
-        if options['save_report']:
-            output_dir = input(f"{Colors.BOLD}Output directory (Enter for current): {Colors.END}").strip()
-            if output_dir and os.path.isdir(output_dir):
-                options['output_dir'] = output_dir
-        
-
-        hide_banner = input(f"{Colors.BOLD}Hide banner on next run? (y/n): {Colors.END}").strip().lower()
-        options['no_banner'] = (hide_banner == 'y')
-        
-        return options
-
-    @staticmethod
-    def configure_tools():
-        """Configure tools and wordlists"""
-        config = {
-            'wordlist_users': None,
-            'wordlist_passwords': None,
-            'enum4linux_path': 'enum4linux',
-            'hydra_path': 'hydra',
-            'timeout': 30,
-            'threads': 10
-        }
-        
-        print(f"\n{Colors.CYAN}{'═'*60}{Colors.END}")
-        print(f"{Colors.BOLD}        ⚙️ TOOL CONFIGURATION{Colors.END}")
-        print(f"{Colors.CYAN}{'═'*60}{Colors.END}\n")
-        
-        print(f"{Colors.BOLD}Wordlist Configuration:{Colors.END}\n")
-        
-
-        use_wordlist = input(f"{Colors.BOLD}Use custom user wordlist? (y/n): {Colors.END}").strip().lower()
-        if use_wordlist == 'y':
-            while True:
-                path = input(f"{Colors.BOLD}Path to user wordlist: {Colors.END}").strip()
-                if os.path.exists(path):
-                    config['wordlist_users'] = path
-                    print(f"{Colors.GREEN}✓ User wordlist set: {path}{Colors.END}")
-                    break
-                else:
-                    print(f"{Colors.RED}✗ File not found: {path}{Colors.END}")
-                    retry = input(f"{Colors.BOLD}Try again? (y/n): {Colors.END}").strip().lower()
-                    if retry != 'y':
-                        break
-        
-
-        use_passlist = input(f"{Colors.BOLD}Use custom password wordlist? (y/n): {Colors.END}").strip().lower()
-        if use_passlist == 'y':
-            while True:
-                path = input(f"{Colors.BOLD}Path to password wordlist: {Colors.END}").strip()
-                if os.path.exists(path):
-                    config['wordlist_passwords'] = path
-                    print(f"{Colors.GREEN}✓ Password wordlist set: {path}{Colors.END}")
-                    break
-                else:
-                    print(f"{Colors.RED}✗ File not found: {path}{Colors.int(f"  {mode}")
-        
-        print()
-        
-        while True:
-            try:
-                choice = input(f"{Colors.BOLD}Select scan mode (1-3): {Colors.END}").strip()
-                if choice in ['1', '2', '3']:
-                    return choice
-                print(f"{Colors.RED}Invalid choice. Please enter 1, 2, or 3.{Colors.END}")
-            except KeyboardInterrupt:
-                print(f"\n{Colors.YELLOW}Operation cancelled.{Colors.END}")
-                return None
-
-    @staticmethod
-    def get_custom_ports():
-        """Get custom ports from user"""
-        print(f"\n{Colors.CYAN}Enter ports to scan:{Colors.END}")
-        print(f"{Colors.GRAY}Examples: 139,445,135,389{Colors.END}")
-        print(f"{Colors.GRAY}          1-100 (range){Colors.END}")
-        print(f"{Colors.GRAY}          22,80,443,8080-8090{Colors.END}\n")
-        
-        while True:
-            try:
-                ports_input = input(f"{Colors.BOLD}Ports: {Colors.END}").strip()
-                
-                if not ports_input:
-                    print(f"{Colors.RED}Please enter at least one port.{Colors.END}")
-                    continue
-                
-                ports = []
-                for part in ports_input.split(','):
-                    part = part.strip()
-                    if '-' in part:
-                        try:
-                            start, end = map(int, part.split('-'))
-                            ports.extend(range(start, end + 1))
-                        except ValueError:
-                            print(f"{Colors.RED}Invalid range: {part}{Colors.END}")
-                            continue
-                    else:
-                        try:
-                            ports.append(int(part))
-                        except ValueError:
-                            print(f"{Colors.RED}Invalid port: {part}{Colors.END}")
-                            continue
-                
-                if not ports:
-                    print(f"{Colors.RED}No valid ports entered.{Colors.END}")
-                    continue
-                
-                ports = sorted(set(ports))
-                
-                invalid_ports = [p for p in ports if p < 1 or p > 65535]
-                if invalid_ports:
-                    print(f"{Colors.RED}Invalid ports (must be 1-65535): {invalid_ports}{Colors.END}")
-                    continue
-                
-                print(f"{Colors.GREEN}✓ Will scan {len(ports)} ports{Colors.END}")
-                return ports
-                
-            except KeyboardInterrupt:
-                print(f"\n{Colors.YELLOW}Operation cancelled.{Colors.END}")
-                return None
-
-    @staticmethod
-    def get_scan_options():
-        """Get additional scan options"""
-        options = {
-            'verbose': False,
-            'force': False,
-            'save_report': True,
-            'output_dir': os.getcwd(),
-            'no_banner': False,
-            'aggressive': False
-        }
-        
-        print(f"\n{Colors.CYAN}{'═'*60}{Colors.END}")
-        print(f"{Colors.BOLD}        ⚙️ SCAN OPTIONS{Colors.END}")
-        print(f"{Colors.CYAN}{'═'*60}{Colors.END}\n")
-        
-
-        verbose = input(f"{Colors.BOLD}Enable verbose output? (y/n): {Colors.END}").strip().lower()
-        options['verbose'] = (verbose == 'y')
-        
-
-        force = input(f"{Colors.BOLD}Force scan even if ports appear closed? (y/n): {Colors.END}").strip().lower()
-        options['force'] = (force == 'y')
-        
-
-        aggressive = input(f"{Colors.BOLD}Enable aggressive mode? (y/n): {Colors.END}").strip().lower()
-        options['aggressive'] = (aggressive == 'y')
-        
-
-        save_report = input(f"{Colors.BOLD}Save results to file? (y/n): {Colors.END}").strip().lower()
-        options['save_report'] = (save_report == 'y')
-        
-        if options['save_report']:
-            output_dir = input(f"{Colors.BOLD}Output directory (Enter for current): {Colors.END}").strip()
-            if output_dir and os.path.isdir(output_dir):
-                options['output_dir'] = output_dir
-        
-
-        hide_banner = input(f"{Colors.BOLD}Hide banner on next run? (y/n): {Colors.END}").strip().lower()
-        options['no_banner'] = (hide_banner == 'y')
-        
-        return options
-
-    @staticmethod
-    def configure_tools():
-        """Configure tools and wordlists"""
-        config = {
-            'wordlist_users': None,
-            'wordlist_passwords': None,
-            'enum4linux_path': 'enum4linux',
-            'hydra_path': 'hydra',
-            'timeout': 30,
-            'threads': 10
-        }
-        
-        print(f"\n{Colors.CYAN}{'═'*60}{Colors.END}")
-        print(f"{Colors.BOLD}        ⚙️ TOOL CONFIGURATION{Colors.END}")
-        print(f"{Colors.CYAN}{'═'*60}{Colors.END}\n")
-        
-        print(f"{Colors.BOLD}Wordlist Configuration:{Colors.END}\n")
-        
-
-        use_wordlist = input(f"{Colors.BOLD}Use custom user wordlist? (y/n): {Colors.END}").strip().lower()
-        if use_wordlist == 'y':
-            while True:
-                path = input(f"{Colors.BOLD}Path to user wordlist: {Colors.END}").strip()
-                if os.path.exists(path):
-                    config['wordlist_users'] = path
-                    print(f"{Colors.GREEN}✓ User wordlist set: {path}{Colors.END}")
-                    break
-                else:
-                    print(f"{Colors.RED}✗ File not found: {path}{Colors.END}")
-                    retry = input(f"{Colors.BOLD}Try again? (y/n): {Colors.END}").strip().lower()
-                    if retry != 'y':
-                        break
-        
-
-        use_passlist = input(f"{Colors.BOLD}Use custom password wordlist? (y/n): {Colors.END}").strip().lower()
-        if use_passlist == 'y':
-            while True:
-                path = input(f"{Colors.BOLD}Path to password wordlist: {Colors.END}").strip()
-                if os.path.exists(path):
-                    config['wordlist_passwords'] = path
-                    print(f"{Colors.GREEN}✓ Password wordlist set: {path}{Colors.END}")
-                    break
-                else:
-                    print(f"{Colors.RED}✗ File not found: {path}{Colors.END}")
-                    retry = input(f"{Colors.BOLD}Try again? (y/n): {Colors.END}").strip().lower()
-                    if retry != 'y':
-                        break
-        
-
-        try:
-            timeout = input(f"{Colors.BOLD}Scan timeout (seconds, default 30): {Colors.END}").strip() or "30"
-            config['timeout'] = max(10, min(int(timeout), 300))
-            print(f"{Colors.GREEN}✓ Timeout set to {config['timeout']} seconds{Colors.END}")
-        except ValueError:
-            print(f"{Colors.YELLOW}⚠ Using default timeout: 30 seconds{Colors.END}")
-        
-
-        try:
-            threads = input(f"{Colors.BOLD}Number of threads (default 10): {Colors.END}").strip() or "10"
-            config['threads'] = max(1, min(int(threads), 50))
-            print(f"{Colors.GREEN}✓ Threads set to {config['threads']}{Colors.END}")
-        except ValueError:
-            print(f"{Colors.YELLOW}⚠ Using default threads: 10{Colors.END}")
-        
-        print(f"\n{Colors.GREEN}✓ Configuration saved{Colors.END}")
-        return config
-
-    @staticmethod
-    def show_next_steps(target, scan_results):
-        """Show next steps menu after scan"""
-        print(f"\n{Colors.CYAN}{'═'*60}{Colors.END}")
-        print(f"{Colors.BOLD}        🔄 POST-SCAN TOOLS - {target}{Colors.END}")
-        print(f"{Colors.CYAN}{'═'*60}{Colors.END}\n")
-        
-        steps = [
-            f"{Colors.BOLD}[1]{Colors.END} {Colors.GREEN}Detailed Enumeration{Colors.END} (enum4linux)",
-            f"{Colors.BOLD}[2]{Colors.END} {Colors.YELLOW}Share Access Testing{Colors.END} (smbclient)",
-            f"{Colors.BOLD}[3]{Colors.END} {Colors.BLUE}Brute Force Testing{Colors.END} (hydra)",
-            f"{Colors.BOLD}[4]{Colors.END} {Colors.PURPLE}Vulnerability Scanning{Colors.END} (nmap)",
-            f"{Colors.BOLD}[5]{Colors.END} {Colors.WHITE}Generate Commands{Colors.END} (manual testing)",
-            f"{Colors.BOLD}[6]{Colors.END} {Colors.RED}Return to Main Menu{Colors.END}"
-        ]
-        
-        for step in steps:
-            print(f"  {step}")
-        
-        print()
-        
-        while True:
-            try:
-                choice = input(f"{Colors.BOLD}Select option (1-6): {Colors.END}").strip()
-                if choice in ['1', '2', '3', '4', '5', '6']:
-                    return choice
-                print(f"{Colors.RED}Invalid choice. Please enter 1-6.{Colors.END}")
-            except KeyboardInterrupt:
-                return '6'
-
-
-
-
-class PortChecker:
-    @staticmethod
-    def check_port_socket(target, port, protocol="tcp", timeout=2):
-        """Check port using socket"""
-        try:
-            if protocol == "tcp":
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            else:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            
-            sock.settimeout(timeout)
-            
-            if protocol == "tcp":
-                result = sock.connect_ex((target, port))
-                sock.close()
-                return result == 0
-            else:
-                sock.sendto(b'\x00', (target, port))
-                sock.settimeout(1)
-                sock.recvfrom(1024)
-                sock.close()
-                return True
-        except socket.timeout:
-            if protocol == "udp":
-                return "filtered"
-            return False
-        except ConnectionRefusedError:
-            return False
-        except Exception:
-            return False
-
-    @staticmethod
-    def check_port_netcat(target, port, protocol="tcp", timeout=2):
-        """Check port using netcat"""
-        try:
-            if protocol == "tcp":
-                cmd = f"timeout {timeout} nc -zv -w1 {target} {port} 2>&1"
-            else:
-                cmd = f"timeout {timeout} nc -zu -w1 {target} {port} 2>&1"
-            
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            return "succeeded" in result.stdout or "open" in result.stdout
-        except:
-            return False
-
-
-
-
-class ZeroScanner:
-    def __init__(self, target, output=None, verbose=False, force=False, scan_mode="basic", custom_ports=None):
-        self.target = target
-        self.output_file = output
-        self.verbose = verbose
-        self.force = force
-        self.scan_mode = scan_mode
-        self.custom_ports = custom_ports
-        self.scan_results = {
-            'ports': [],
-            'shares': [],
-            'os_info': 'Unknown',
-            'eternalblue': False,
-            'start_time': datetime.now().isoformat()
-        }
-        self.port_checker = PortChecker()
-    
-    def log(self, message, level="INFO"):
-        """Log messages with colors"""
-        level_colors = {
-            "INFO": Colors.BLUE,
-            "SUCCESS": Colors.GREEN,
-            "WARNING": Colors.YELLOW,
-            "ERROR": Colors.RED,
-            "SCAN": Colors.PURPLE,
-            "DEBUG": Colors.GRAY
-        }
-        
-        color = level_colors.get(level, Colors.WHITE)
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        
-        log_msg = f"{Colors.GRAY}[{timestamp}]{Colors.END} {color}[{level}]{Colors.END} {message}"
-        print(log_msg)
-        
-        if self.output_file and level in ["SUCCESS", "WARNING", "ERROR", "SCAN"]:
-            with open(self.output_file, 'a') as f:
-                f.write(f"[{timestamp}] [{level}] {message}\n")
-    
-    def check_dependencies(self):
-        """Check for required tools"""
-        tools = ['nmap', 'smbclient', 'nc']
-        missing = []
-        
-        for tool in tools:
-            try:
-                if tool == 'nc':
-                    subprocess.run(['which', 'nc'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-                else:
-                    subprocess.run([tool, '--version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-                self.log(f"{tool} found", "SUCCESS")
-            except:
-                missing.append(tool)
-                self.log(f"{tool} not found", "WARNING")
-        
-        if missing:
-            self.log(f"Missing tools: {', '.join(missing)}", "ERROR")
-        
-        return len(missing) == 0
-    
-    def get_ports_to_scan(self):
-        """Get ports based on scan mode"""
-        SMB_PORTS = {
-            "basic": [
-                {"port": 139, "protocol": "tcp", "service": "NetBIOS Session"},
-                {"port": 445, "protocol": "tcp", "service": "SMB over TCP"}
-            ],
-            "full": [
-                {"port": 139, "protocol": "tcp", "service": "NetBIOS Session"},
-                {"port": 445, "protocol": "tcp", "service": "SMB over TCP"},
-                {"port": 137, "protocol": "udp", "service": "NetBIOS Name Service"},
-                {"port": 138, "protocol": "udp", "service": "NetBIOS Datagram"},
-                {"port": 135, "protocol": "tcp", "service": "MSRPC"},
-                {"port": 389, "protocol": "tcp", "service": "LDAP"},
-                {"port": 636, "protocol": "tcp", "service": "LDAPS"},
-                {"port": 88, "protocol": "tcp", "service": "Kerberos"},
-                {"port": 464, "protocol": "tcp", "service": "Kerberos Password"},
-                {"port": 53, "protocol": "tcp", "service": "DNS"},
-                {"port": 53, "protocol": "udp", "service": "DNS"},
-                {"port": 3389, "protocol": "tcp", "service": "RDP"}
-            ]
-        }
-        
-        if self.scan_mode == "custom" and self.custom_ports:
-            return [{"port": p, "protocol": "tcp", "service": "Custom"} for p in self.custom_ports]
-        elif self.scan_mode in SMB_PORTS:
-            return SMB_PORTS[self.scan_mode]
-        else:
-            return SMB_PORTS["basic"]
-    
-    def scan_ports(self):
-        """Scan SMB ports"""
-        ports_to_scan = self.get_ports_to_scan()
-        
-        if self.scan_mode == "custom":
-            self.log(f"Starting custom port scan ({len(ports_to_scan)} ports)", "SCAN")
-        else:
-            self.log(f"Starting {self.scan_mode} scan ({len(ports_to_scan)} ports)", "SCAN")
-        
-        open_ports = []
-        
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_port = {}
-            
-            for port_info in ports_to_scan:
-                future = executor.submit(
-                    self.check_single_port,
-                    port_info['port'],
-                    port_info.get('protocol', 'tcp'),
-                    port_info.get('service', 'Unknown')
-                )
-                future_to_port[future] = port_info
-            
-            for future in as_completed(future_to_port):
-                port_info = future_to_port[future]
+    def verificar_portas(self):
+        lista = ([(p, "tcp", "Personalizada") for p in self.portas]
+                 if self.modo == "custom" else PORTAS[self.modo])
+        self.dados["total_portas_verificadas"] = len(lista)
+        self.informar(f"Verificando {len(lista)} portas no alvo {self.alvo}...")
+        with ThreadPoolExecutor(max_workers=self.threads) as executor:
+            tarefas = {
+                executor.submit(testar_porta, self.alvo, p, proto, self.tempo): (p, proto, servico)
+                for p, proto, servico in lista
+            }
+            for futuro in as_completed(tarefas):
+                porta, protocolo, servico = tarefas[futuro]
                 try:
-                    is_open, _ = future.result()
-                    
-                    if is_open:
-                        status = "OPEN"
-                        color = Colors.GREEN
-                        protocol = port_info.get('protocol', 'tcp')
-                        service = port_info.get('service', 'Unknown')
-                        self.log(f"Port {port_info['port']}/{protocol} ({service}): {color}{status}{Colors.END}", "SUCCESS")
-                        open_ports.append({
-                            'port': port_info['port'],
-                            'protocol': protocol,
-                            'service': service,
-                            'status': status
+                    status = futuro.result()
+                    if status in ("aberta", "respondeu"):
+                        self.dados["portas_abertas"].append({
+                            "porta": porta, "protocolo": protocolo,
+                            "servico": servico, "estado": status,
                         })
-                    elif self.verbose:
-                        protocol = port_info.get('protocol', 'tcp')
-                        self.log(f"Port {port_info['port']}/{protocol}: CLOSED", "DEBUG")
-                except Exception as e:
-                    self.log(f"Error scanning port {port_info['port']}: {e}", "ERROR")
-        
-        self.scan_results['ports'] = open_ports
-        self.scan_results['total_scanned'] = len(ports_to_scan)
-        self.scan_results['open_ports'] = len(open_ports)
-        
-        self.log(f"\n📊 Port Scan Summary:", "INFO")
-        self.log(f"  Scanned: {len(ports_to_scan)} ports", "INFO")
-        self.log(f"  Open: {len(open_ports)} ports", "SUCCESS" if open_ports else "WARNING")
-        
-        return len(open_ports) > 0 or self.force
-    
-    def check_single_port(self, port, protocol="tcp", service="Unknown"):
-        """Check a single port"""
-        methods = {}
-        methods['socket'] = self.port_checker.check_port_socket(self.target, port, protocol)
-        methods['netcat'] = self.port_checker.check_port_netcat(self.target, port, protocol)
-        
-        is_open = any(methods.values())
-        if protocol == "udp" and methods.get('socket') == "filtered":
-            is_open = "filtered"
-        
-        return is_open, methods
-    
-    def run_nmap_smb_scan(self):
-        """Run detailed Nmap SMB scan"""
-        self.log("\nRunning detailed SMB scan with Nmap...", "SCAN")
-        
+                        self.informar(f"{porta}/{protocolo} ({servico}): {status}", "OK")
+                    elif status == "inconclusiva":
+                        self.dados["portas_udp_sem_resposta"].append(porta)
+                        if self.detalhado:
+                            self.informar(f"{porta}/udp: sem resposta (inconclusivo)", "AVISO")
+                    elif self.detalhado:
+                        self.informar(f"{porta}/{protocolo}: sem conexão", "DEBUG")
+                except Exception as erro:
+                    self.dados["erros"].append(str(erro))
+        self.dados["portas_abertas"].sort(key=lambda item: (item["porta"], item["protocolo"]))
+
+    def identificar_smb(self):
+        if not shutil.which("nmap"):
+            return
         try:
-            cmd = f"nmap -p 139,445 -sV --script smb-os-discovery,smb-security-mode,smb-protocols {self.target}"
-            
-            if self.verbose:
-                self.log(f"Command: {cmd}", "DEBUG")
-            
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
-            
-            if result.returncode == 0:
-                self.log("Nmap scan completed", "SUCCESS")
-                
-                for line in result.stdout.split('\n'):
-                    if "OS:" in line:
-                        self.scan_results['os_info'] = line.strip()
-                        self.log(f"OS Info: {line.strip()}", "SUCCESS")
-                        break
-                    elif "Samba" in line or "Windows" in line:
-                        self.scan_results['os_info'] = line.strip()
-                        self.log(f"Service: {line.strip()}", "SUCCESS")
-                        break
-                
-                if self.verbose:
-                    print(result.stdout[:800])
-                
-            else:
-                self.log("Nmap scan failed", "ERROR")
-                
-        except Exception as e:
-            self.log(f"Nmap error: {e}", "ERROR")
-    
-    def enumerate_shares(self):
-        """Enumerate SMB shares"""
-        self.log("\nEnumerating SMB shares...", "SCAN")
-        
+            comando = [
+                "nmap", "-Pn", "-p", "139,445", "-sV", "--script",
+                "smb-os-discovery,smb-security-mode,smb-protocols", self.alvo,
+            ]
+            resultado = executar(comando, max(30, self.tempo * 10))
+            if resultado.returncode != 0:
+                self.informar("Nmap não conseguiu identificar o serviço SMB.", "AVISO")
+                return
+            for linha in resultado.stdout.splitlines():
+                if re.search(r"\bOS:\s*", linha):
+                    self.dados["sistema_operacional"] = linha.strip().lstrip("|_ ")
+                    break
+            if self.detalhado:
+                print(resultado.stdout[:2000])
+        except (OSError, subprocess.TimeoutExpired) as erro:
+            self.dados["erros"].append(f"Nmap SMB: {erro}")
+            self.informar(f"Falha na identificação SMB: {erro}", "AVISO")
+
+    def listar_compartilhamentos(self):
+        if not shutil.which("smbclient"):
+            return
         try:
-            cmd = f"smbclient -L //{self.target}/ -N 2>&1"
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
-            
-            shares = []
-            lines = result.stdout.split('\n')
-            in_share_section = False
-            
-            for line in lines:
-                line = line.strip()
-                
-                if "Sharename" in line and "Type" in line and "Comment" in line:
-                    in_share_section = True
+            resultado = executar(["smbclient", "-g", "-L", f"//{self.alvo}/", "-N"],
+                                max(15, self.tempo * 10))
+            if resultado.returncode != 0:
+                self.informar("Não foi possível listar compartilhamentos anonimamente.", "AVISO")
+                return
+            for linha in resultado.stdout.splitlines():
+                campos = linha.strip().split("|", 2)
+                if len(campos) != 3:
                     continue
-                
-                if in_share_section:
-                    if line.startswith('---') or not line:
-                        continue
-                    
-                    if "Server" in line or "Workgroup" in line or "Reconnecting" in line:
-                        break
-                    
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        share_name = parts[0]
-                        share_type = parts[1]
-                        comment = ' '.join(parts[2:]) if len(parts) > 2 else ''
-                        
-                        if share_type in ['Disk', 'IPC', 'Printer']:
-                            shares.append({
-                                'name': share_name,
-                                'type': share_type,
-                                'comment': comment
-                            })
-                            
-                            self.log(f"Found share: {share_name} ({share_type})", "SUCCESS")
-            
-            self.scan_results['shares'] = shares
-            self.scan_results['shares_count'] = len(shares)
-            
-            if not shares:
-                self.log("No accessible shares found", "WARNING")
-            else:
-                self.log(f"Total shares found: {len(shares)}", "SUCCESS")
-                
-        except Exception as e:
-            self.log(f"Share enumeration error: {e}", "ERROR")
-    
-    def check_eternalblue(self):
-        """Check for MS17-010 EternalBlue vulnerability"""
-        self.log("\nChecking for EternalBlue (MS17-010)...", "SCAN")
-        
+                tipo, nome, comentario = campos
+                if tipo not in ("Disk", "IPC", "Printer") or not nome:
+                    continue
+                self.dados["compartilhamentos"].append({
+                    "nome": nome, "tipo": tipo, "comentario": comentario
+                })
+            self.informar(
+                f"{len(self.dados['compartilhamentos'])} compartilhamento(s) listado(s). "
+                "A listagem não comprova permissão de acesso.", "INFO"
+            )
+        except (OSError, subprocess.TimeoutExpired) as erro:
+            self.dados["erros"].append(f"smbclient: {erro}")
+            self.informar(f"Falha na listagem: {erro}", "AVISO")
+
+    def verificar_ms17_010(self):
+        if not shutil.which("nmap"):
+            return
         try:
-            cmd = f"nmap -p 445 --script smb-vuln-ms17-010 {self.target}"
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
-            
-            if "VULNERABLE" in result.stdout:
-                self.log("🚨 VULNERABLE to EternalBlue (MS17-010)!", "ERROR")
-                self.scan_results['eternalblue'] = True
+            resultado = executar(
+                ["nmap", "-Pn", "-p", "445", "--script", "smb-vuln-ms17-010", self.alvo],
+                max(30, self.tempo * 10),
+            )
+            if resultado.returncode != 0:
+                self.dados["ms17_010"] = "inconclusivo"
             else:
-                self.log("Not vulnerable to EternalBlue", "SUCCESS")
-                self.scan_results['eternalblue'] = False
-                
-        except Exception as e:
-            self.log(f"EternalBlue check error: {e}", "ERROR")
-    
-    def generate_report(self, output_dir="."):
-        """Generate scan report"""
-        self.log("\nGenerating final report...", "INFO")
-        
-        report = {
-            'scanner': 'ZERO Scanner v1.0',
-            'author': '.Zer0',
-            'github': 'https://github.com/zeroaualy/zero-scanner',
-            'target': self.target,
-            'scan_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            'scan_mode': self.scan_mode,
-            'scan_results': self.scan_results
+                self.dados["ms17_010"] = situacao_vulnerabilidade(resultado.stdout)
+            estado = self.dados["ms17_010"]
+            self.informar(f"Verificação MS17-010: {estado.replace('_', ' ')}",
+                         "ALERTA" if estado == "vulneravel" else "INFO")
+        except (OSError, subprocess.TimeoutExpired) as erro:
+            self.dados["ms17_010"] = "inconclusivo"
+            self.dados["erros"].append(f"MS17-010: {erro}")
+            self.informar("Verificação MS17-010 inconclusiva.", "AVISO")
+
+    def relatorios(self):
+        if self.saida:
+            arquivo_json = Path(self.saida)
+            if arquivo_json.suffix.lower() != ".json":
+                arquivo_json = arquivo_json.with_suffix(".json")
+        else:
+            agora = datetime.now().strftime("%Y%m%d_%H%M%S")
+            arquivo_json = Path(f"zero_scan_{self.alvo}_{agora}.json")
+        arquivo_txt = arquivo_json.with_suffix(".txt")
+        arquivo_json.parent.mkdir(parents=True, exist_ok=True)
+        relatorio = {
+            "programa": f"ZERO Scanner {VERSAO}",
+            "autor": "Rodrigo Segobia",
+            "repositorio": REPOSITORIO,
+            "alvo": self.alvo,
+            "data": datetime.now().isoformat(timespec="seconds"),
+            "modo": self.modo,
+            "resultados": self.dados,
+            "observacao": "Resultados indicativos; inconclusivo não significa seguro.",
         }
-        
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        json_file = os.path.join(output_dir, f"zero_scan_{self.target}_{timestamp}.json")
-        
-        with open(json_file, 'w') as f:
-            json.dump(report, f, indent=4, ensure_ascii=False)
-        self.log(f"JSON report saved to: {json_file}", "SUCCESS")
-        
-
-        text_file = os.path.join(output_dir, f"zero_scan_{self.target}_{timestamp}.txt")
-        
-        with open(text_file, 'w', encoding='utf-8') as f:
-            f.write("="*70 + "\n")
-            f.write(f"ZERO SCANNER REPORT\n")
-            f.write(f"Scan date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Target: {self.target}\n")
-            f.write(f"Mode: {self.scan_mode}\n")
-            f.write("="*70 + "\n\n")
-            
-            f.write("[SUMMARY]\n")
-            f.write(f"Target: {self.target}\n")
-            f.write(f"Ports scanned: {self.scan_results.get('total_scanned', 0)}\n")
-            f.write(f"Ports open: {self.scan_results.get('open_ports', 0)}\n")
-            f.write(f"Shares found: {self.scan_results.get('shares_count', 0)}\n")
-            f.write(f"EternalBlue vulnerable: {self.scan_results.get('eternalblue', False)}\n")
-            f.write(f"OS detected: {self.scan_results.get('os_info', 'Unknown')}\n\n")
-            
-            if self.scan_results.get('ports'):
-                f.write("[OPEN PORTS]\n")
-                for port in self.scan_results['ports']:
-                    f.write(f"  {port['port']}/{port['protocol']} - {port['service']}\n")
-                f.write("\n")
-            
-            if self.scan_results.get('shares'):
-                f.write("[SMB SHARES]\n")
-                for share in self.scan_results['shares']:
-                    f.write(f"  {share['name']} ({share['type']})")
-                    if share.get('comment'):
-                        f.write(f" - {share['comment']}")
-                    f.write("\n")
-                f.write("\n")
-            
-            f.write("[RECOMMENDATIONS]\n")
-            rec_num = 1
-            
-            if self.scan_results.get('eternalblue') == True:
-                f.write(f"{rec_num}. CRITICAL: Patch MS17-010 vulnerability immediately!\n")
-                rec_num += 1
-            
-            if self.scan_results.get('shares_count', 0) > 0:
-                f.write(f"{rec_num}. Review SMB share permissions\n")
-                rec_num += 1
-            
-            if self.scan_results.get('ports_open', 0) > 0:
-                f.write(f"{rec_num}. Enable SMB signing for security\n")
-                rec_num += 1
-                f.write(f"{rec_num}. Use strong passwords for SMB access\n")
-            
-            if rec_num == 1:
-                f.write("1. No critical issues found\n")
-        
-        self.log(f"Text report saved to: {text_file}", "SUCCESS")
-        return report
-    
-    def print_summary(self):
-        """Print scan summary"""
-        print(f"\n{Colors.CYAN}{'='*60}{Colors.END}")
-        print(f"{Colors.BOLD}           SCAN COMPLETED - SUMMARY{Colors.END}")
-        print(f"{Colors.CYAN}{'='*60}{Colors.END}\n")
-        
-        print(f"{Colors.BOLD}📊 RESULTS:{Colors.END}")
-        print(f"  • Target: {self.target}")
-        print(f"  • Scan Mode: {self.scan_mode.upper()}")
-        print(f"  • Ports Open: {self.scan_results.get('open_ports', 0)}/{self.scan_results.get('total_scanned', 0)}")
-        print(f"  • Shares Found: {self.scan_results.get('shares_count', 0)}")
-        
-        eternalblue = self.scan_results.get('eternalblue')
-        if eternalblue == True:
-            print(f"  • EternalBlue: {Colors.RED}VULNERABLE{Colors.END}")
-        else:
-            print(f"  • EternalBlue: {Colors.GREEN}NOT VULNERABLE{Colors.END}")
-        
-        os_info = self.scan_results.get('os_info', 'Unknown')
-        if os_info != 'Unknown':
-            print(f"  • OS Info: {os_info}")
-        
-        print(f"\n{Colors.BOLD}🎯 RECOMMENDATIONS:{Colors.END}")
-        rec_num = 1
-        
-        if eternalblue == True:
-            print(f"  {rec_num}. {Colors.RED}PATCH MS17-010 vulnerability!{Colors.END}")
-            rec_num += 1
-        
-        if self.scan_results.get('shares_count', 0) > 0:
-            print(f"  {rec_num}. Review share permissions")
-            rec_num += 1
-        
-        if self.scan_results.get('ports_open', 0) > 0:
-            print(f"  {rec_num}. Enable SMB signing")
-            rec_num += 1
-            print(f"  {rec_num}. Use strong passwords")
-        
-        if rec_num == 1:
-            print("  1. No critical issues found")
-        
-        print(f"\n{Colors.GREEN}✓ Reports have been saved{Colors.END}")
-    
-    def run_scan(self):
-        """Execute complete scan"""
-        try:
-            if not self.check_dependencies():
-                if not self.force:
-                    self.log("Missing dependencies", "ERROR")
-                    return False
-            
-            if not self.scan_ports():
-                if not self.force:
-                    self.log("No open ports found", "WARNING")
-                    return False
-            
-            smb_ports_open = any(p['port'] in [139, 445] for p in self.scan_results.get('ports', []))
-            
-            if smb_ports_open or self.force:
-                self.run_nmap_smb_scan()
-                self.enumerate_shares()
-                self.check_eternalblue()
-            
-            if self.output_file:
-                self.generate_report(os.path.dirname(self.output_file))
-            else:
-                self.generate_report()
-            
-            self.print_summary()
-            return True
-            
-        except KeyboardInterrupt:
-            self.log("\nScan interrupted", "WARNING")
-            return False
-        except Exception as e:
-            self.log(f"Error: {e}", "ERROR")
-            return False
-
-
-
-
-class PostScanTools:
-    @staticmethod
-    def run_enum4linux(target, config):
-        """Run enum4linux comprehensive scan"""
-        print(f"\n{Colors.CYAN}{'═'*60}{Colors.END}")
-        print(f"{Colors.BOLD}        🔍 ENUM4LINUX - {target}{Colors.END}")
-        print(f"{Colors.CYAN}{'═'*60}{Colors.END}\n")
-        
-
-        missing_deps = []
-        for tool in ['nmblookup', 'rpcclient', 'smbclient', 'ldapsearch']:
-            try:
-                subprocess.run(['which', tool], check=True, 
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except:
-                missing_deps.append(tool)
-        
-        if missing_deps:
-            print(f"{Colors.RED}Missing dependencies for enum4linux:{Colors.END}")
-            for dep in missing_deps:
-                print(f"  {Colors.RED}✗{Colors.END} {dep}")
-            print(f"\n{Colors.YELLOW}Install with:{Colors.END}")
-            print(f"  sudo apt-get install samba-common-bin samba-client ldap-utils")
-            return
-        
-        commands = [
-            f"enum4linux -a {target}",
-            f"enum4linux -U {target}",
-            f"enum4linux -G {target}",
-            f"enum4linux -S {target}"
+        arquivo_json.write_text(json.dumps(relatorio, ensure_ascii=False, indent=2),
+                                encoding="utf-8")
+        texto = [
+            "ZERO SCANNER - RELATÓRIO DE SEGURANÇA",
+            f"Autor: Rodrigo Segobia | {REPOSITORIO}",
+            f"Alvo: {self.alvo}",
+            f"Modo: {self.modo}",
+            f"Data: {relatorio['data']}",
+            f"Portas verificadas: {self.dados['total_portas_verificadas']}",
+            f"Portas com resposta: {len(self.dados['portas_abertas'])}",
+            f"Compartilhamentos listados: {len(self.dados['compartilhamentos'])}",
+            f"MS17-010: {self.dados['ms17_010']}",
+            f"Sistema operacional: {self.dados['sistema_operacional'] or 'não identificado'}",
+            "",
+            "PORTAS COM RESPOSTA:",
         ]
-        
-        for cmd in commands:
-            print(f"{Colors.BOLD}Running: {cmd}{Colors.END}")
-            try:
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=config.get('timeout', 30))
-                print(result.stdout[:500])
-                print(f"{Colors.GREEN}{'─'*40}{Colors.END}\n")
-            except Exception as e:
-                print(f"{Colors.RED}Error: {e}{Colors.END}\n")
-    
-    @staticmethod
-    def test_share_access(target, shares):
-        """Test access to SMB shares"""
-        print(f"\n{Colors.CYAN}{'═'*60}{Colors.END}")
-        print(f"{Colors.BOLD}        🔓 SHARE ACCESS TESTING - {target}{Colors.END}")
-        print(f"{Colors.CYAN}{'═'*60}{Colors.END}\n")
-        
-        if not shares:
-            print(f"{Colors.YELLOW}No shares to test.{Colors.END}")
-            return
-        
-        print(f"{Colors.BOLD}Testing all shares anonymously...{Colors.END}\n")
-        
-        for share in shares[:5]:
-            share_name = share['name']
-            cmd = f"smbclient //{target}/{share_name} -N -c 'ls' 2>&1"
-            
-            print(f"Testing {share_name}...")
-            try:
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
-                if "NT_STATUS_ACCESS_DENIED" in result.stdout:
-                    print(f"  {Colors.RED}✗ Access denied{Colors.END}")
-                elif "Domain=" in result.stdout:
-                    print(f"  {Colors.GREEN}✓ Access granted!{Colors.END}")
-                else:
-                    print(f"  {Colors.YELLOW}? {result.stdout[:50]}...{Colors.END}")
-            except Exception as e:
-                print(f"  {Colors.RED}Error: {e}{Colors.END}")
-    
-    @staticmethod  
-    def run_vulnerability_scan(target):
-        """Run SMB vulnerability scans"""
-        print(f"\n{Colors.CYAN}{'═'*60}{Colors.END}")
-        print(f"{Colors.BOLD}        ⚠️ VULNERABILITY SCANNING - {target}{Colors.END}")
-        print(f"{Colors.CYAN}{'═'*60}{Colors.END}\n")
-        
-        vuln_scripts = [
-            "smb-vuln-ms17-010",
-            "smb-vuln-ms10-054",
-            "smb-vuln-ms10-061",
-            "smb-vuln-cve-2017-7494"
-        ]
-        
-        for script in vuln_scripts:
-            cmd = f"nmap -p 445 --script {script} {target}"
-            print(f"{Colors.BOLD}Checking: {script}{Colors.END}")
-            
-            try:
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
-                if "VULNERABLE" in result.stdout:
-                    print(f"{Colors.RED}  🚨 VULNERABILITY FOUND!{Colors.END}")
-                else:
-                    print(f"{Colors.GREEN}  ✓ Not vulnerable{Colors.END}")
-            except Exception:
-                print(f"{Colors.YELLOW}  ⚠ Scan failed{Colors.END}")
-    
-    @staticmethod
-    def generate_commands(target, scan_results):
-        """Generate commands for manual testing"""
-        print(f"\n{Colors.CYAN}{'═'*60}{Colors.END}")
-        print(f"{Colors.BOLD}        📋 GENERATED COMMANDS - {target}{Colors.END}")
-        print(f"{Colors.CYAN}{'═'*60}{Colors.END}\n")
-        
-        commands = f"""
-{Colors.BOLD}📌 ENUMERATION COMMANDS:{Colors.END}
-
-{Colors.GREEN}1. Detailed Enumeration:{Colors.END}
-enum4linux -a {target}
-enum4linux -U {target}
-enum4linux -G {target}
-
-{Colors.GREEN}2. SMB Share Discovery:{Colors.END}
-smbclient -L //{target}/ -N
-smbclient -L //{target}/ -U "guest"
-
-{Colors.GREEN}3. Share Access Testing:{Colors.END}
-"""
-        
-        if scan_results.get('shares'):
-            for share in scan_results['shares'][:3]:
-                share_name = share['name']
-                commands += f"smbclient //{target}/{share_name} -N\n"
-        
-        commands += f"""
-{Colors.GREEN}4. Vulnerability Scanning:{Colors.END}
-nmap --script smb-vuln-* -p 445,139 {target}
-nmap -p 445 --script smb-vuln-ms17-010 {target}
-
-{Colors.GREEN}5. Advanced Detection:{Colors.END}
-nmap -sV -sC -p 445,139 {target}
-nmap -p 445 --script smb-protocols {target}
-
-{Colors.YELLOW}⚠️ LEGAL DISCLAIMER:{Colors.END}
-Only use on systems you own or have permission to test.
-"""
-        
-        print(commands)
-        
-        save = input(f"\n{Colors.BOLD}Save to file? (y/n): {Colors.END}").strip().lower()
-        if save == 'y':
-            filename = f"commands_{target}.txt"
-            with open(filename, 'w') as f:
-                f.write(commands)
-            print(f"{Colors.GREEN}Saved to: {filename}{Colors.END}")
-
-
-
-
-class ZeroScannerApp:
-    def __init__(self):
-        self.config = {}
-        self.scan_results = {}
-        self.current_target = None
-    
-    def run(self):
-        """Main application loop"""
-        while True:
-            try:
-                show_banner()
-                
-
-                if not check_all_dependencies():
-                    print(f"\n{Colors.RED}Cannot continue without required dependencies.{Colors.END}")
-                    choice = input(f"{Colors.BOLD}Exit? (y/n): {Colors.END}").strip().lower()
-                    if choice == 'y':
-                        sys.exit(1)
-                    else:
-                        continue
-                
-                choice = MenuSystem.show_main_menu()
-                
-                if choice == '1':
-                    self.quick_scan()
-                elif choice == '2':
-                    self.advanced_audit()
-                elif choice == '3':
-                    self.custom_configuration()
-                elif choice == '4':
-                    self.post_scan_tools()
-                elif choice == '5':
-                    self.exit_app()
-                    
-            except KeyboardInterrupt:
-                print(f"\n{Colors.YELLOW}Operation cancelled.{Colors.END}")
-                time.sleep(1)
-            except Exception as e:
-                print(f"\n{Colors.RED}Error: {e}{Colors.END}")
-                time.sleep(2)
-    
-    def quick_scan(self):
-        """Run quick SMB scan"""
-        clear_screen()
-        show_banner()
-        
-        target = MenuSystem.get_target()
-        if not target:
-            return
-        
-        self.current_target = target
-        
-        print(f"\n{Colors.BOLD}Starting quick scan...{Colors.END}")
-        time.sleep(1)
-        
-        scanner = ZeroScanner(target=target, scan_mode="basic", verbose=False)
-        success = scanner.run_scan()
-        
-        if success:
-            self.scan_results = scanner.scan_results
-            self.show_next_steps()
-    
-    def advanced_audit(self):
-        """Run advanced audit"""
-        clear_screen()
-        show_banner()
-        
-        target = MenuSystem.get_target()
-        if not target:
-            return
-        
-        self.current_target = target
-        
-        mode_choice = MenuSystem.get_scan_mode()
-        if not mode_choice:
-            return
-        
-        if mode_choice == '1':
-            scan_mode = "basic"
-            custom_ports = None
-        elif mode_choice == '2':
-            scan_mode = "full"
-            custom_ports = None
-        else:
-            custom_ports = MenuSystem.get_custom_ports()
-            if not custom_ports:
-                return
-            scan_mode = "custom"
-        
-        options = MenuSystem.get_scan_options()
-        
-        print(f"\n{Colors.BOLD}Starting advanced audit...{Colors.END}")
-        time.sleep(1)
-        
-        scanner = ZeroScanner(
-            target=target,
-            scan_mode=scan_mode,
-            custom_ports=custom_ports,
-            verbose=options['verbose'],
-            force=options['force']
+        texto.extend(
+            f"  {item['porta']}/{item['protocolo']} - {item['servico']}"
+            for item in self.dados["portas_abertas"]
         )
-        
-        if options['save_report']:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            scanner.output_file = os.path.join(options['output_dir'], f"scan_{target}_{timestamp}.json")
-        
-        success = scanner.run_scan()
-        
-        if success:
-            self.scan_results = scanner.scan_results
-            self.show_next_steps()
-    
-    def custom_configuration(self):
-        """Configure tools"""
-        clear_screen()
-        show_banner()
-        
-        self.config = MenuSystem.configure_tools()
-        input(f"\n{Colors.BOLD}Press Enter to continue...{Colors.END}")
-    
-    def post_scan_tools(self):
-        """Run post-scan tools"""
-        if not self.current_target:
-            print(f"\n{Colors.RED}No target scanned yet.{Colors.END}")
-            input(f"{Colors.BOLD}Press Enter to continue...{Colors.END}")
+        texto.append("\nCOMPARTILHAMENTOS LISTADOS (ACESSO NÃO CONFIRMADO):")
+        texto.extend(
+            f"  {item['nome']} ({item['tipo']}) - {item['comentario']}"
+            for item in self.dados["compartilhamentos"]
+        )
+        texto.extend([
+            "\nRECOMENDAÇÕES:",
+            "  Revisar permissões SMB, atualizações de segurança e serviços expostos.",
+            "  Avaliar assinatura SMB e desativação de SMBv1 quando aplicável.",
+            "  Repetir testes inconclusivos com ferramentas e permissões adequadas.",
+            "\nO resultado não substitui uma auditoria de segurança completa.",
+        ])
+        arquivo_txt.write_text("\n".join(texto) + "\n", encoding="utf-8")
+        self.informar(f"Relatórios salvos: {arquivo_json} e {arquivo_txt}", "OK")
+
+    def executar(self):
+        self.verificar_ferramentas()
+        self.verificar_portas()
+        smb_aberto = any(item["porta"] in (139, 445) and
+                         item["protocolo"] == "tcp"
+                         for item in self.dados["portas_abertas"])
+        if smb_aberto or self.forcar:
+            self.identificar_smb()
+            self.listar_compartilhamentos()
+            self.verificar_ms17_010()
+        else:
+            self.informar("SMB não identificado como aberto; verificações SMB ignoradas.", "AVISO")
+        self.resumo()
+        if self.salvar:
+            self.relatorios()
+        return self.dados
+
+    def resumo(self):
+        self.informar(
+            f"Resumo: {len(self.dados['portas_abertas'])}/"
+            f"{self.dados['total_portas_verificadas']} portas com resposta; "
+            f"{len(self.dados['compartilhamentos'])} compartilhamentos; "
+            f"MS17-010: {self.dados['ms17_010']}.", "INFO"
+        )
+        print("Aviso: portas UDP sem resposta e testes SMB inconclusivos não comprovam segurança.")
+
+
+def solicitar_alvo():
+    while True:
+        alvo = input("IP ou nome do host autorizado (Enter para cancelar): ").strip()
+        if not alvo:
+            return None
+        if validar_alvo(alvo):
+            return alvo
+        print("Alvo inválido. Use IPv4 ou nome de host, sem espaços ou parâmetros.")
+
+
+def pos_varredura(alvo, dados, tempo=30):
+    if not alvo:
+        print("Faça uma varredura antes de acessar estas opções.")
+        return
+    while True:
+        print("\nPÓS-VARREDURA")
+        print("[1] Enumeração com enum4linux/enum4linux-ng")
+        print("[2] Testar listagem anônima dos compartilhamentos encontrados")
+        print("[3] Verificações adicionais de vulnerabilidades SMB")
+        print("[4] Exibir comandos para análise manual")
+        print("[5] Voltar")
+        escolha = input("Opção: ").strip()
+        if escolha == "5":
             return
-        
-        clear_screen()
-        show_banner()
-        
-        while True:
-            choice = MenuSystem.show_next_steps(self.current_target, self.scan_results)
-            
-            if choice == '1':
-                PostScanTools.run_enum4linux(self.current_target, self.config)
-            elif choice == '2':
-                shares = self.scan_results.get('shares', [])
-                PostScanTools.test_share_access(self.current_target, shares)
-            elif choice == '3':
-                print(f"\n{Colors.YELLOW}Brute force requires Hydra and wordlists.{Colors.END}")
-                print(f"{Colors.YELLOW}Configure in Custom Configuration menu.{Colors.END}")
-            elif choice == '4':
-                PostScanTools.run_vulnerability_scan(self.current_target)
-            elif choice == '5':
-                PostScanTools.generate_commands(self.current_target, self.scan_results)
-            elif choice == '6':
-                break
-            
-            if choice != '6':
-                input(f"\n{Colors.BOLD}Press Enter to continue...{Colors.END}")
-    
-    def show_next_steps(self):
-        """Show next steps after scan"""
-        choice = MenuSystem.show_next_steps(self.current_target, self.scan_results)
-        
-        if choice == '1':
-            PostScanTools.run_enum4linux(self.current_target, self.config)
-        elif choice == '2':
-            shares = self.scan_results.get('shares', [])
-            PostScanTools.test_share_access(self.current_target, shares)
-        elif choice == '4':
-            PostScanTools.run_vulnerability_scan(self.current_target)
-        elif choice == '5':
-            PostScanTools.generate_commands(self.current_target, self.scan_results)
-        
-        if choice != '6':
-            input(f"\n{Colors.BOLD}Press Enter to continue...{Colors.END}")
-    
-    def exit_app(self):
-        """Exit application"""
-        print(f"\n{Colors.GREEN}Thank you for using ZERO Scanner!{Colors.END}")
-        print(f"{Colors.GRAY}Author: .Zer0 | GitHub: zeroaualy{Colors.END}\n")
-        sys.exit(0)
-
-
-
-
-def cli_mode():
-    """Command line interface mode"""
-    parser = argparse.ArgumentParser(description='ZERO Scanner - Advanced SMB Security Assessment Tool')
-    parser.add_argument('target', nargs='?', help='Target IP address or hostname')
-    parser.add_argument('-m', '--mode', choices=['basic', 'full', 'custom'], default='basic',
-                       help='Scan mode: basic, full, or custom')
-    parser.add_argument('-p', '--ports', help='Custom ports (comma-separated or ranges)')
-    parser.add_argument('-o', '--output', help='Output file for results')
-    parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
-    parser.add_argument('-f', '--force', action='store_true', help='Force scan')
-    parser.add_argument('-i', '--interactive', action='store_true', help='Interactive mode')
-    
-    args = parser.parse_args()
-    
-
-    if not check_all_dependencies():
-        print(f"{Colors.RED}Cannot continue without required dependencies.{Colors.END}")
-        sys.exit(1)
-    
-    if args.interactive or not args.target:
-
-        app = ZeroScannerApp()
-        app.run()
-    else:
-
-        custom_ports = None
-        if args.mode == 'custom' and args.ports:
+        if escolha == "1":
+            base, opcao = resolver_enum4linux()
+            if not base:
+                print("enum4linux ou enum4linux-ng não encontrado.")
+                continue
             try:
-                ports = []
-                for part in args.ports.split(','):
-                    part = part.strip()
-                    if '-' in part:
-                        start, end = map(int, part.split('-'))
-                        ports.extend(range(start, end + 1))
-                    else:
-                        ports.append(int(part))
-                custom_ports = sorted(set(ports))
+                retorno = executar(base + [opcao, alvo], max(60, tempo * 10))
+                print((retorno.stdout or retorno.stderr)[:10000])
+            except (OSError, subprocess.TimeoutExpired) as erro:
+                print(f"Falha na enumeração: {erro}")
+        elif escolha == "2":
+            if not shutil.which("smbclient"):
+                print("Instale smbclient para testar acesso anônimo.")
+                continue
+            compartilhamentos = dados.get("compartilhamentos", [])
+            if not compartilhamentos:
+                print("Nenhum compartilhamento foi listado.")
+            for item in compartilhamentos[:5]:
+                nome = item["nome"]
+                try:
+                    retorno = executar(["smbclient", f"//{alvo}/{nome}", "-N", "-c", "ls"], 15)
+                    print(f"{nome}: {'acesso permitido' if retorno.returncode == 0 else 'acesso não confirmado/negado'}")
+                except (OSError, subprocess.TimeoutExpired) as erro:
+                    print(f"{nome}: falha ({erro})")
+        elif escolha == "3":
+            if not shutil.which("nmap"):
+                print("Instale nmap para verificar vulnerabilidades.")
+                continue
+            for script in ("smb-vuln-ms17-010", "smb-vuln-ms10-054",
+                           "smb-vuln-ms10-061", "smb-vuln-cve-2017-7494"):
+                try:
+                    retorno = executar(["nmap", "-Pn", "-p", "445", "--script", script, alvo], 90)
+                    status = (situacao_vulnerabilidade(retorno.stdout)
+                              if retorno.returncode == 0 else "inconclusivo")
+                    print(f"{script}: {status}")
+                except (OSError, subprocess.TimeoutExpired):
+                    print(f"{script}: inconclusivo")
+        elif escolha == "4":
+            comandos = [
+                f"nmap -Pn -sV -p 139,445 {alvo}",
+                f"nmap -Pn -p 445 --script smb-protocols {alvo}",
+                f"nmap -Pn -p 445 --script smb-vuln-ms17-010 {alvo}",
+                f"smbclient -L //{alvo}/ -N",
+            ]
+            print("\n".join(comandos))
+        else:
+            print("Opção inválida.")
+
+
+def modo_interativo(sem_banner=False):
+    ultimo_alvo, ultimos_dados = None, {}
+    tempo, threads = 3, 10
+    while True:
+        if not sem_banner:
+            print(f"\nZERO Scanner v{VERSAO} | Rodrigo Segobia")
+        print("\n[1] Varredura rápida SMB (139 e 445/TCP)")
+        print("[2] Varredura avançada ou portas personalizadas")
+        print("[3] Ajustar tempo limite e número de threads")
+        print("[4] Ferramentas pós-varredura")
+        print("[5] Sair")
+        escolha = input("Opção: ").strip()
+        if escolha == "5":
+            print("Obrigado por utilizar o ZERO Scanner. Rodrigo Segobia.")
+            return
+        if escolha == "3":
+            try:
+                tempo = int(input("Tempo por porta em segundos (1-30): "))
+                threads = int(input("Threads simultâneas (1-50): "))
+                if not (1 <= tempo <= 30 and 1 <= threads <= 50):
+                    raise ValueError()
             except ValueError:
-                print(f"{Colors.RED}Invalid port format{Colors.END}")
-                return
-        
-        scanner = ZeroScanner(
-            target=args.target,
-            output=args.output,
-            verbose=args.verbose,
-            force=args.force,
-            scan_mode=args.mode,
-            custom_ports=custom_ports
-        )
-        
-        scanner.run_scan()
+                print("Valores inválidos; padrões restaurados.")
+                tempo, threads = 3, 10
+            continue
+        if escolha == "4":
+            pos_varredura(ultimo_alvo, ultimos_dados)
+            continue
+        if escolha not in ("1", "2"):
+            print("Opção inválida.")
+            continue
+        alvo = solicitar_alvo()
+        if not alvo:
+            continue
+        modo, portas, forcar = "basic", None, False
+        if escolha == "2":
+            escolha_modo = input("Modo [1] básico [2] completo [3] personalizado: ").strip()
+            if escolha_modo == "2":
+                modo = "full"
+            elif escolha_modo == "3":
+                modo = "custom"
+                try:
+                    portas = analisar_portas(input("Portas (ex.: 139,445,8000-8005): "))
+                except ValueError as erro:
+                    print(erro)
+                    continue
+            elif escolha_modo != "1":
+                print("Modo inválido.")
+                continue
+            forcar = input("Executar testes SMB mesmo sem resposta em 139/445? (s/N): ").strip().lower() == "s"
+        resposta = input("Salvar relatório JSON e TXT? (S/n): ").strip().lower()
+        salvar = resposta != "n"
+        saida = None
+        if salvar:
+            saida = input("Caminho do JSON (Enter para gerar nome): ").strip() or None
+        scanner = Scanner(alvo, modo=modo, portas=portas, saida=saida,
+                          detalhado=(escolha == "2"), forcar=forcar,
+                          tempo=tempo, threads=threads, salvar=salvar)
+        try:
+            ultimos_dados = scanner.executar()
+            ultimo_alvo = alvo
+        except (OSError, ValueError) as erro:
+            print(f"Erro na varredura: {erro}")
 
 
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="ZERO Scanner: varredura de portas e análise SMB autorizada."
+    )
+    parser.add_argument("target", nargs="?", help="IPv4 ou nome DNS do alvo")
+    parser.add_argument("-m", "--mode", choices=("basic", "full", "custom"),
+                        default="basic", help="Modo: basic, full ou custom")
+    parser.add_argument("-p", "--ports", help="Portas TCP para o modo custom")
+    parser.add_argument("-o", "--output", help="Caminho de saída do relatório JSON")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Exibir detalhes")
+    parser.add_argument("-f", "--force", action="store_true",
+                        help="Tentar verificação SMB mesmo sem portas SMB abertas")
+    parser.add_argument("-i", "--interactive", action="store_true", help="Abrir menu")
+    parser.add_argument("--no-banner", action="store_true", help="Ocultar cabeçalho no menu")
+    parser.add_argument("--no-report", action="store_true", help="Não salvar relatórios")
+    parser.add_argument("--timeout", type=int, default=3, help="Tempo por porta (1-30 s)")
+    parser.add_argument("--threads", type=int, default=10, help="Threads (1-50)")
+    args = parser.parse_args(argv)
+
+    if args.interactive or args.target is None:
+        modo_interativo(sem_banner=args.no_banner)
+        return 0
+    if not validar_alvo(args.target):
+        parser.error("alvo inválido: informe IPv4 ou nome DNS válido")
+    if not (1 <= args.timeout <= 30 and 1 <= args.threads <= 50):
+        parser.error("timeout deve estar entre 1 e 30 e threads entre 1 e 50")
+    if args.mode != "custom" and args.ports:
+        parser.error("-p/--ports só pode ser usado com -m custom")
+    if args.mode == "custom" and not args.ports:
+        parser.error("o modo custom exige -p/--ports")
+    try:
+        portas = analisar_portas(args.ports) if args.mode == "custom" else None
+        scanner = Scanner(args.target, modo=args.mode, portas=portas,
+                          saida=args.output, detalhado=args.verbose,
+                          forcar=args.force, tempo=args.timeout,
+                          threads=args.threads, salvar=not args.no_report)
+        scanner.executar()
+    except (ValueError, OSError) as erro:
+        parser.error(str(erro))
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        if len(sys.argv) > 1:
-            cli_mode()
-        else:
-            app = ZeroScannerApp()
-            app.run()
+        sys.exit(main())
     except KeyboardInterrupt:
-        print(f"\n{Colors.YELLOW}Scanner terminated{Colors.END}")
-    except Exception as e:
-        print(f"\n{Colors.RED}Fatal error: {e}{Colors.END}")
-        sys.exit(1)
+        print("\nOperação interrompida pelo usuário.")
+        sys.exit(130)
